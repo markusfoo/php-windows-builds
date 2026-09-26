@@ -1,12 +1,39 @@
-name: Build PHP 8.6.0-dev TS Windows VS18 (x86 + x64 + AVX2)
+name: Build PHP TS Windows VS18 (x86 + x64 + AVX2, any php/php-src ref)
+
+# ============================================================================
+# UNIVERSAL PHP BUILDER
+#
+# Builds a Thread Safe (ZTS) Windows PHP distribution from ANY php/php-src
+# ref -- no version is hardcoded:
+#
+#   php_ref       = master      -> next dev version (currently 8.7.0-dev;
+#                                 was 8.6.0-dev until the PHP-8.6 branch
+#                                 was cut)
+#                 = PHP-8.6     -> the 8.6 release branch (8.6.0-dev +
+#                                 release candidates once branched)
+#                 = php-8.6.0RC1 (any tag) -> that exact release
+#
+#   php_version   = auto (default) -> the version string for artifact and
+#                 release naming is DETECTED from the checked-out source
+#                 (main/php_version.h), so a build can never be mislabeled
+#                 again. Any other value is used verbatim as the label.
+#
+# History: this workflow was introduced as build-php86-dev-latest.yaml when
+# master was 8.6.0-dev; it was renamed and universalized on 2026-09-26 when
+# master bumped to 8.7.0-dev (see README changelog).
+# ============================================================================
 
 on:
   workflow_dispatch:
     inputs:
-      php_version:
-        description: 'PHP version string for artifact naming (placeholder: {{PHP_VERSION}} in release body)'
+      php_ref:
+        description: 'php/php-src ref to build: branch (master, PHP-8.6), tag (php-8.6.0RC1) or SHA'
         required: false
-        default: '8.6.0-dev'
+        default: 'master'
+      php_version:
+        description: 'Version label for artifacts/releases; "auto" = detect from the checked-out source (main/php_version.h)'
+        required: false
+        default: 'auto'
       include_avx2:
         description: 'Also build AVX2-optimized binaries (Intel Haswell 2013+, AMD Ryzen 2017+)'
         required: false
@@ -18,12 +45,14 @@ on:
         default: true
         type: boolean
 
-env:
-  PHP_VERSION: ${{ inputs.php_version }}
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2025
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -42,12 +71,12 @@ jobs:
         if: ${{ matrix.arch == 'x86' && !inputs.include_x86 }}
         run: echo "x86 build skipped (include_x86=false)" && exit 0
 
-      - name: Checkout PHP source (master branch with latest commits)
+      - name: Checkout PHP source (${{ inputs.php_ref }})
         if: ${{ !(matrix.avx == 'yes' && !inputs.include_avx2) && !(matrix.arch == 'x86' && !inputs.include_x86) }}
         uses: actions/checkout@v7
         with:
           repository: php/php-src
-          ref: master
+          ref: ${{ inputs.php_ref }}
           path: php-src
           fetch-depth: 1
 
@@ -59,6 +88,21 @@ jobs:
           ref: master
           path: php-sdk
           fetch-depth: 1
+
+      - name: Resolve PHP version (auto-detect from source)
+        if: ${{ !(matrix.avx == 'yes' && !inputs.include_avx2) && !(matrix.arch == 'x86' && !inputs.include_x86) }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = '${{ inputs.php_version }}'
+          if ($version -eq 'auto') {
+              $m = Select-String -Path "php-src\main\php_version.h" -Pattern '^#define\s+PHP_VERSION\s+"([^"]+)"'
+              if (-not $m) { throw "Could not parse PHP_VERSION from php-src\main\php_version.h" }
+              $version = $m.Matches[0].Groups[1].Value
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+') { throw "Invalid PHP version label: $version" }
+          Write-Host "PHP version for this build: $version (source ref: ${{ inputs.php_ref }})"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PHP_VERSION=$version`n")
 
       - name: Generate build_php.bat via PowerShell (avoid cmd echo ^ escaping issues)
         if: ${{ !(matrix.avx == 'yes' && !inputs.include_avx2) && !(matrix.arch == 'x86' && !inputs.include_x86) }}
@@ -244,6 +288,23 @@ jobs:
           path: ${{ github.workspace }}/php-*.zip
           retention-days: 90
 
+      - name: Write build metadata (consumed by the release job)
+        if: ${{ matrix.arch == 'x64' && matrix.avx == 'no' }}
+        shell: pwsh
+        run: |
+          $meta = "PHP_VERSION=${{ env.PHP_VERSION }}`nPHP_REF=${{ inputs.php_ref }}`n"
+          [System.IO.File]::WriteAllText("${{ github.workspace }}\build-meta.env", $meta)
+          Write-Host "build-meta.env:"
+          Get-Content "${{ github.workspace }}\build-meta.env"
+
+      - name: Upload build metadata
+        if: ${{ matrix.arch == 'x64' && matrix.avx == 'no' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-meta
+          path: ${{ github.workspace }}/build-meta.env
+          retention-days: 1
+
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -268,11 +329,15 @@ jobs:
         run: |
           BUILD_DATE=$(date -u +'%Y-%m-%d')
           BUILD_TIME=$(date -u +'%H:%M UTC')
-          TAG="php-${{ inputs.php_version }}-${BUILD_DATE}"
+          PHP_VERSION=$(grep -oP '^PHP_VERSION=\K.*' artifacts/build-meta/build-meta.env)
+          PHP_REF=$(grep -oP '^PHP_REF=\K.*' artifacts/build-meta/build-meta.env)
+          TAG="php-${PHP_VERSION}-${BUILD_DATE}"
           echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
           echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
-          PHP_COMMIT=$(curl -s https://api.github.com/repos/php/php-src/commits/master | grep -oE '"sha":"[a-f0-9]+"' | head -1 | cut -d'"' -f4)
+          echo "php_version=${PHP_VERSION}" >> $GITHUB_OUTPUT
+          echo "php_ref=${PHP_REF}" >> $GITHUB_OUTPUT
+          PHP_COMMIT=$(curl -s "https://api.github.com/repos/php/php-src/commits/${PHP_REF}" | grep -oE '"sha":"[a-f0-9]+"' | head -1 | cut -d'"' -f4)
           echo "php_commit=${PHP_COMMIT:0:12}" >> $GITHUB_OUTPUT
           echo "php_commit_full=${PHP_COMMIT}" >> $GITHUB_OUTPUT
 
@@ -280,13 +345,14 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag_name }}
-          name: PHP ${{ inputs.php_version }} TS Windows VS18 - ${{ steps.meta.outputs.build_date }}
+          name: PHP ${{ steps.meta.outputs.php_version }} TS Windows VS18 - ${{ steps.meta.outputs.build_date }}
           body: |
-            # PHP ${{ inputs.php_version }} - Thread Safe Windows Build (VS2024)
+            # PHP ${{ steps.meta.outputs.php_version }} - Thread Safe Windows Build (VS2024)
 
             | Field | Value |
             |---|---|
             | **Build date** | ${{ steps.meta.outputs.build_date }} ${{ steps.meta.outputs.build_time }} |
+            | **Source ref** | `${{ steps.meta.outputs.php_ref }}` |
             | **PHP source commit** | [${{ steps.meta.outputs.php_commit }}](https://github.com/php/php-src/commit/${{ steps.meta.outputs.php_commit_full }}) |
             | **Compiler** | Visual Studio 2024 (VC18, vs18) |
             | **Build type** | Thread Safe (ZTS) - for Apache mod_php and XAMPP |
@@ -298,11 +364,11 @@ jobs:
 
             | Asset | Architecture | Optimization |
             |---|---|---|
-            | `php-{{PHP_VERSION}}-ts-Win32-vs18-x64.zip` | x64 | Standard |
-            | `php-{{PHP_VERSION}}-ts-Win32-vs18-x86.zip` | x86 | Standard |
-            | `php-{{PHP_VERSION}}-ts-Win32-vs18-x64-AVX2.zip` | x64 | AVX2 |
-            | `php-{{PHP_VERSION}}-ts-Win32-vs18-x86-AVX2.zip` | x86 | AVX2 |
-            | `php-devel-pack-{{PHP_VERSION}}-ts-Win32-vs18-x64.zip` | x64 | Devel pack (headers + libs + phpize) |
+            | `php-${{ steps.meta.outputs.php_version }}-ts-Win32-vs18-x64.zip` | x64 | Standard |
+            | `php-${{ steps.meta.outputs.php_version }}-ts-Win32-vs18-x86.zip` | x86 | Standard |
+            | `php-${{ steps.meta.outputs.php_version }}-ts-Win32-vs18-x64-AVX2.zip` | x64 | AVX2 |
+            | `php-${{ steps.meta.outputs.php_version }}-ts-Win32-vs18-x86-AVX2.zip` | x86 | AVX2 |
+            | `php-devel-pack-${{ steps.meta.outputs.php_version }}-ts-Win32-vs18-x64.zip` | x64 | Devel pack (headers + libs + phpize) |
 
             ## Contents
 
@@ -324,16 +390,11 @@ jobs:
 
             ## Features
 
-            PHP 8.6 features included:
-            - Partial Function Application (PFA) - `?` placeholder
-            - clamp() built-in function
-            - Readonly Property Defaults - `public readonly array $x = [];`
-            - SortDirection enum
-            - And all other PHP 8.6 features
+            This build tracks the php/php-src **${{ steps.meta.outputs.php_ref }}** ref. See the linked source commit above for the exact feature set -- master snapshots contain the newest, unreleased PHP features.
 
             ## Source
 
-            - Built from: https://github.com/php/php-src (master branch)
+            - Built from: https://github.com/php/php-src (ref: ${{ steps.meta.outputs.php_ref }})
             - Commit: ${{ steps.meta.outputs.php_commit_full }}
             - PHP SDK: https://github.com/php/php-sdk-binary-tools
             - Compiler: VS2024 (vs18) on windows-2025 runner
@@ -341,7 +402,7 @@ jobs:
 
             ---
 
-            *Automated build via workflow `build-php86-dev-latest.yaml`.*
+            *Automated build via workflow `build-php-dev-latest.yaml`.*
           files: release_assets/*.zip
           generate_release_notes: false
           draft: false

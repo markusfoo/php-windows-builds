@@ -1,4 +1,4 @@
-name: Build Imagick PHP 8.6 VS18 x64 (from own releases)
+name: Build Imagick PHP VS18 x64 (from own releases)
 
 # ============================================================================
 # ROOT CAUSE (verified directly against php-src win32/build/confutils.js and
@@ -37,7 +37,7 @@ name: Build Imagick PHP 8.6 VS18 x64 (from own releases)
 #
 # BEFORE RUNNING THIS WORKFLOW, upload this ONE file into your repo:
 #
-#   vendor/imagick-php86-patched.zip   <- your already-patched imagick source (~570 KB)
+#   vendor/imagick-patched.zip   <- your already-patched imagick source (~570 KB)
 #
 # This is the exact file you already have locally. Using a vendored copy
 # instead of re-cloning/re-patching from GitHub at runtime removes upstream
@@ -58,12 +58,19 @@ on:
         description: "Build Non-Thread-Safe (NTS) variant"
         type: boolean
         default: true
+      php_version:
+        description: "PHP series used for artifact/release naming (TS builds target the latest PHP release from this repo; e.g. 8.6, 8.7)"
+        type: string
+        default: "8.6"
+      qa_version:
+        description: "Full PHP version of the official php.net QA build used for NTS binaries/devel packs and the script/ fallback (e.g. 8.6.0beta2, 8.6.0RC1)"
+        type: string
+        default: "8.6.0beta2"
 
 permissions:
   contents: read
 
 env:
-  PHP_VERSION: "8.6.0"
   IMAGEMAGICK_VERSION: "7.1.1-47"
 
 jobs:
@@ -74,7 +81,7 @@ jobs:
 
   build-ts:
     if: ${{ inputs.build_ts }}
-    name: Build Imagick PHP 8.6 TS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+    name: Build Imagick PHP TS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
     runs-on: windows-2025
     strategy:
       fail-fast: false
@@ -90,7 +97,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $f = "vendor\imagick-php86-patched.zip"
+          $f = "vendor\imagick-patched.zip"
           if (-not (Test-Path $f)) {
               throw "Missing required vendored file: $f -- upload it to the repo first (see comments at the top of this workflow)."
           }
@@ -101,7 +108,7 @@ jobs:
       # own releases + ImageMagick deps from php.net).
       # --------------------------------------------------------
 
-      - name: Download PHP 8.6 TS binary + devel pack from own releases
+      - name: Download PHP TS binary + devel pack from own releases
         shell: pwsh
         env:
           IMAGEMAGICK_VERSION: "7.1.1-47"
@@ -138,9 +145,9 @@ jobs:
 
           # Find latest release from our own repo
           $headers = @{ "Authorization" = "Bearer $env:GH_TOKEN"; "Accept" = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/markusfoo/php86-windows-builds/releases?per_page=5" -Headers $headers
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/markusfoo/php-windows-builds/releases?per_page=5" -Headers $headers
           $release = $releases | Where-Object { $_.assets.Count -gt 0 -and $_.prerelease } | Select-Object -First 1
-          if (-not $release) { throw "No prerelease found in markusfoo/php86-windows-builds" }
+          if (-not $release) { throw "No prerelease found in markusfoo/php-windows-builds" }
 
           Write-Host "Using release: $($release.tag_name) ($($release.assets.Count) assets)"
 
@@ -160,7 +167,7 @@ jobs:
           # Our custom devel pack is missing script/ (phpize.js etc.) because
           # buildconf doesn't generate it for dev builds. Download the official
           # QA devel pack to steal its script/ directory.
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-8.6.0beta2-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-${{ inputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
 
           # ImageMagick deps from php.net PECL (unchanged)
           Get-FileWithRetry -Url "https://downloads.php.net/~windows/pecl/deps/ImageMagick-$env:IMAGEMAGICK_VERSION-vs17-x64.zip" -OutFile "imagemagick.zip"
@@ -215,7 +222,7 @@ jobs:
           if (Test-Path "C:\imagick-ts") { Remove-Item "C:\imagick-ts" -Recurse -Force }
           New-Item -ItemType Directory -Path "C:\imagick-ts-raw" -Force | Out-Null
 
-          Expand-Archive -Path "vendor\imagick-php86-patched.zip" -DestinationPath "C:\imagick-ts-raw" -Force
+          Expand-Archive -Path "vendor\imagick-patched.zip" -DestinationPath "C:\imagick-ts-raw" -Force
 
           $configw32 = Get-ChildItem -Path "C:\imagick-ts-raw" -Recurse -Filter "config.w32" | Select-Object -First 1
           if (-not $configw32) { throw "config.w32 not found inside vendored imagick source zip." }
@@ -426,7 +433,7 @@ jobs:
           set "SOURCE=C:\imagick-ts"
 
           echo ========================================
-          echo PHP 8.6 TS x64 / Imagick
+          echo PHP TS x64 / Imagick
           echo ========================================
           echo PHP_DEV:      %PHP_DEV%
           echo IMAGEMAGICK:  %IMAGEMAGICK%
@@ -584,13 +591,13 @@ jobs:
           Get-ChildItem -Path "C:\ImageMagick\bin" -Filter "*.dll" -File | ForEach-Object {
               Copy-Item -Path $_.FullName -Destination "C:\artifact-ts" -Force
           }
-          Compress-Archive -Path "C:\artifact-ts\*" -DestinationPath "imagick-php8.6-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
+          Compress-Archive -Path "C:\artifact-ts\*" -DestinationPath "imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
 
       - name: Upload TS artifact
         uses: actions/upload-artifact@v6
         with:
-          name: imagick-php8.6-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
-          path: imagick-php8.6-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
+          name: imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+          path: imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
           if-no-files-found: error
 
 
@@ -600,7 +607,7 @@ jobs:
 
   build-nts:
     if: ${{ inputs.build_nts }}
-    name: Build Imagick PHP 8.6 NTS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+    name: Build Imagick PHP NTS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
     runs-on: windows-2025
     strategy:
       fail-fast: false
@@ -616,16 +623,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $f = "vendor\imagick-php86-patched.zip"
+          $f = "vendor\imagick-patched.zip"
           if (-not (Test-Path $f)) {
               throw "Missing required vendored file: $f -- upload it to the repo first (see comments at the top of this workflow)."
           }
           Write-Host "Found: $f"
 
-      - name: Download PHP 8.6 NTS binary + devel pack + ImageMagick deps
+      - name: Download PHP NTS binary + devel pack + ImageMagick deps
         shell: pwsh
         env:
-          PHP_VERSION: "8.6.0beta2"
+          QA_VERSION: ${{ inputs.qa_version }}
           IMAGEMAGICK_VERSION: "7.1.1-47"
         run: |
           $ErrorActionPreference = "Stop"
@@ -657,8 +664,8 @@ jobs:
               throw "Failed to download a valid archive from $Url after $Retries attempts."
           }
 
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-$env:PHP_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-$env:PHP_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
           Get-FileWithRetry -Url "https://downloads.php.net/~windows/pecl/deps/ImageMagick-$env:IMAGEMAGICK_VERSION-vs17-x64.zip" -OutFile "imagemagick.zip"
 
       - name: Download and extract PHP SDK
@@ -703,7 +710,7 @@ jobs:
           if (Test-Path "C:\imagick-nts") { Remove-Item "C:\imagick-nts" -Recurse -Force }
           New-Item -ItemType Directory -Path "C:\imagick-nts-raw" -Force | Out-Null
 
-          Expand-Archive -Path "vendor\imagick-php86-patched.zip" -DestinationPath "C:\imagick-nts-raw" -Force
+          Expand-Archive -Path "vendor\imagick-patched.zip" -DestinationPath "C:\imagick-nts-raw" -Force
 
           $configw32 = Get-ChildItem -Path "C:\imagick-nts-raw" -Recurse -Filter "config.w32" | Select-Object -First 1
           if (-not $configw32) { throw "config.w32 not found inside vendored imagick source zip." }
@@ -848,7 +855,7 @@ jobs:
           set "SOURCE=C:\imagick-nts"
 
           echo ========================================
-          echo PHP 8.6 NTS x64 / Imagick
+          echo PHP NTS x64 / Imagick
           echo ========================================
 
           where cl    >nul || (echo ERROR: cl.exe not found & exit /b 1)
@@ -996,13 +1003,13 @@ jobs:
           Get-ChildItem -Path "C:\ImageMagick\bin" -Filter "*.dll" -File | ForEach-Object {
               Copy-Item -Path $_.FullName -Destination "C:\artifact-nts" -Force
           }
-          Compress-Archive -Path "C:\artifact-nts\*" -DestinationPath "imagick-php8.6-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
+          Compress-Archive -Path "C:\artifact-nts\*" -DestinationPath "imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
 
       - name: Upload NTS artifact
         uses: actions/upload-artifact@v6
         with:
-          name: imagick-php8.6-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
-          path: imagick-php8.6-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
+          name: imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+          path: imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
           if-no-files-found: error
 
 
@@ -1034,7 +1041,7 @@ jobs:
         run: |
           BUILD_DATE=$(date -u +'%Y-%m-%d')
           BUILD_TIME=$(date -u +'%H:%M UTC')
-          TAG="imagick-php8.6-vs18-x64-${BUILD_DATE}"
+          TAG="imagick-php${{ inputs.php_version }}-vs18-x64-${BUILD_DATE}"
           echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
           echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
@@ -1043,16 +1050,16 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag_name }}
-          name: Imagick PHP 8.6 VS18 x64 - ${{ steps.meta.outputs.build_date }}
+          name: Imagick PHP ${{ inputs.php_version }} VS18 x64 - ${{ steps.meta.outputs.build_date }}
           body: |
-            # Imagick extension for PHP 8.6 - VS2024 x64 builds
+            # Imagick extension for PHP ${{ inputs.php_version }} - VS2024 x64 builds
 
             | Field | Value |
             |---|---|
             | **Build date** | ${{ steps.meta.outputs.build_date }} ${{ steps.meta.outputs.build_time }} |
             | **Compiler** | Visual Studio 2024 (VC18, vs18) |
             | **Runner** | windows-2025 |
-            | **PHP version** | 8.6.0beta2 |
+            | **PHP version** | ${{ inputs.php_version }} (TS: latest from own releases; NTS: official QA ${{ inputs.qa_version }}) |
             | **ImageMagick** | 7.1.1-47 |
             | **Variants** | TS + NTS + AVX2 |
 
@@ -1062,10 +1069,10 @@ jobs:
 
             | Asset | Type | Optimization | Use case |
             |---|---|---|---|
-            | `imagick-php8.6-vs18-x64-ts.zip` | Thread Safe | Standard | Apache mod_php / XAMPP |
-            | `imagick-php8.6-vs18-x64-ts-AVX2.zip` | Thread Safe | AVX2 | Apache mod_php with AVX2 CPU |
-            | `imagick-php8.6-vs18-x64-nts.zip` | Non-Thread Safe | Standard | IIS / Nginx FastCGI |
-            | `imagick-php8.6-vs18-x64-nts-AVX2.zip` | Non-Thread Safe | AVX2 | FastCGI with AVX2 CPU |
+            | `imagick-php${{ inputs.php_version }}-vs18-x64-ts.zip` | Thread Safe | Standard | Apache mod_php / XAMPP |
+            | `imagick-php${{ inputs.php_version }}-vs18-x64-ts-AVX2.zip` | Thread Safe | AVX2 | Apache mod_php with AVX2 CPU |
+            | `imagick-php${{ inputs.php_version }}-vs18-x64-nts.zip` | Non-Thread Safe | Standard | IIS / Nginx FastCGI |
+            | `imagick-php${{ inputs.php_version }}-vs18-x64-nts-AVX2.zip` | Non-Thread Safe | AVX2 | FastCGI with AVX2 CPU |
 
             ## Installation
 
@@ -1081,7 +1088,7 @@ jobs:
 
             ## Requirements
 
-            - PHP 8.6.0beta2 or newer (matching the variant: TS or NTS)
+            - PHP ${{ inputs.qa_version }} or newer, matching the built variant (TS or NTS)
             - For AVX2 builds: Intel Haswell (2013+) or AMD Ryzen (2017+) CPU
             - Windows x64 (10/11, Server 2016+)
 
