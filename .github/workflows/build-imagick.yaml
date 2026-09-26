@@ -1113,7 +1113,7 @@ jobs:
           for f in release_assets/*.zip; do
             base=$(basename "$f" .zip)
             type="Thread Safe"
-            case "$base" in *-nts-*) type="Non-Thread Safe";; esac
+            case "$base" in *-nts|*-nts-*) type="Non-Thread Safe";; esac
             opt="Standard"
             case "$base" in *-AVX2) opt="AVX2";; esac
             use="Apache mod_php / XAMPP"
