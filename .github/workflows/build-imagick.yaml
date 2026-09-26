@@ -30,9 +30,10 @@ name: Build Imagick PHP VS18 x64 (from own releases)
 #   discovering the problem minutes later when the DLL search comes up empty.
 #
 #   The zend_is_callable -> zend_is_callable_ex patch (required because PHP
-#   8.6 made zend_is_callable a non-exported static inline function) is
-#   already correctly applied in the vendored imagick source and is left
-#   untouched. This was never the problem.
+#   8.6 made zend_is_callable a non-exported static inline function; the
+#   patch applies to PHP 8.6, 8.7 and every later version) is already
+#   correctly applied in the vendored imagick source and is left untouched.
+#   This was never the problem.
 # ============================================================================
 #
 # BEFORE RUNNING THIS WORKFLOW, upload this ONE file into your repo:
@@ -58,14 +59,14 @@ on:
         description: "Build Non-Thread-Safe (NTS) variant"
         type: boolean
         default: true
-      php_version:
-        description: "PHP series used for artifact/release naming (TS builds target the latest PHP release from this repo; e.g. 8.6, 8.7)"
+      php_release:
+        description: "Own-repo PHP release the TS variant builds against: 'latest' (newest php-* release with assets), a series ('8.6', '8.7') or an exact tag ('php-8.6.0RC2')"
         type: string
-        default: "8.6"
+        default: "latest"
       qa_version:
-        description: "Full PHP version of the official php.net QA build used for NTS binaries/devel packs and the script/ fallback (e.g. 8.6.0beta2, 8.6.0RC1)"
+        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC2)"
         type: string
-        default: "8.6.0beta2"
+        default: "8.6.0RC2"
 
 permissions:
   contents: read
@@ -83,6 +84,9 @@ jobs:
     if: ${{ inputs.build_ts }}
     name: Build Imagick PHP TS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
     runs-on: windows-2025
+    outputs:
+      php_series: ${{ steps.select_release.outputs.php_series }}
+      release_tag: ${{ steps.select_release.outputs.release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -109,6 +113,7 @@ jobs:
       # --------------------------------------------------------
 
       - name: Download PHP TS binary + devel pack from own releases
+        id: select_release
         shell: pwsh
         env:
           IMAGEMAGICK_VERSION: "7.1.1-47"
@@ -143,13 +148,31 @@ jobs:
               throw "Failed to download a valid archive from $Url after $Retries attempts."
           }
 
-          # Find latest release from our own repo
+          # Select the own-repo release to build the TS variant against,
+          # per the php_release input:
+          #   'latest'       -> newest php-* release that has assets
+          #   '8.6' / '8.7'  -> newest release of that series (tag prefix php-8.6.)
+          #   'php-8.6.0RC2' -> that exact tag
           $headers = @{ "Authorization" = "Bearer $env:GH_TOKEN"; "Accept" = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/markusfoo/php-windows-builds/releases?per_page=5" -Headers $headers
-          $release = $releases | Where-Object { $_.assets.Count -gt 0 -and $_.prerelease } | Select-Object -First 1
-          if (-not $release) { throw "No prerelease found in markusfoo/php-windows-builds" }
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/markusfoo/php-windows-builds/releases?per_page=30" -Headers $headers
+          $candidates = $releases | Where-Object { $_.prerelease -and $_.assets.Count -gt 0 -and $_.tag_name -match '^php-' }
+          if (-not $candidates) { throw "No php-* release with assets found in markusfoo/php-windows-builds - run the build-php-dev-latest workflow first." }
 
-          Write-Host "Using release: $($release.tag_name) ($($release.assets.Count) assets)"
+          $wanted = "${{ inputs.php_release }}"
+          if ($wanted -eq "latest") {
+              $release = $candidates | Select-Object -First 1
+          } else {
+              $prefix = if ($wanted -match '^php-') { $wanted } else { "php-$wanted" }
+              $release = $candidates | Where-Object { $_.tag_name -eq $wanted -or $_.tag_name.StartsWith("$prefix.") } | Select-Object -First 1
+              if (-not $release) { throw "No own-repo release matches php_release='$wanted'. Available: $($candidates.tag_name -join ', ')" }
+          }
+
+          # Derive the PHP series from the selected tag (php-8.7.0-dev-2026-09-26 -> 8.7)
+          # so artifact and release naming always reflects what was ACTUALLY built.
+          $phpSeries = (($release.tag_name -replace '^php-', '') -split '\.' | Select-Object -First 2) -join '.'
+          Write-Host "Using release: $($release.tag_name) ($($release.assets.Count) assets) -> PHP series $phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_tag=$($release.tag_name)"
 
           # Find the right assets
           $phpBin = $release.assets | Where-Object { $_.name -match '^php-.*-ts-Win32-vs18-x64\.zip$' -and $_.name -notmatch 'AVX2' -and $_.name -notmatch 'devel' } | Select-Object -First 1
@@ -231,7 +254,7 @@ jobs:
 
           Write-Host "imagick source root: C:\imagick-ts"
 
-      - name: Verify PHP 8.6 compatibility patch is present
+      - name: Verify PHP 8.6+ compatibility patch is present
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -242,14 +265,14 @@ jobs:
           $text = Get-Content -Path $source -Raw
 
           if ($text.Contains('zend_is_callable(user_callback, 0, NULL TSRMLS_CC)')) {
-              throw "The OLD zend_is_callable() call is still present - this build will fail to link against PHP 8.6's php8ts.dll. The vendored zip is not actually patched."
+              throw "The OLD zend_is_callable() call is still present - this build will fail to link against a PHP 8.6+ php8ts.dll. The vendored zip is not actually patched."
           }
 
           if (-not $text.Contains('zend_is_callable_ex(user_callback, NULL, 0, NULL, NULL, NULL)')) {
-              throw "The PHP 8.6 compatibility patch (zend_is_callable_ex) was not found. The vendored zip is not actually patched."
+              throw "The PHP 8.6+ compatibility patch (zend_is_callable_ex) was not found. The vendored zip is not actually patched."
           }
 
-          Write-Host "PHP 8.6 compatibility patch confirmed present."
+          Write-Host "PHP 8.6+ compatibility patch confirmed present."
 
       # --------------------------------------------------------
       # Extract PHP binary + devel pack
@@ -337,7 +360,20 @@ jobs:
           Write-Host "Custom lib contents:"
           Get-ChildItem -Path $customLib -File | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1KB, 0)) KB)" }
 
-          # Replace the official lib/ with our custom one
+          # Overlay our custom include/ on top of the official pack. The
+          # headers MUST come from the exact PHP we build against: PHP checks
+          # ZEND_MODULE_API_NO at extension load time (8.6 = 20260924,
+          # 8.7.0-dev = 20260925), so a DLL compiled against the QA headers
+          # of a different series would fail to load. Merging (not replacing)
+          # keeps official-only extras (script/, win32/) that our pack does
+          # not ship.
+          $customInclude = "$customDevelDir\include"
+          if (-not (Test-Path $customInclude)) { throw "include/ not found in our custom devel pack." }
+          Copy-Item -Path "$customInclude\*" -Destination "C:\php-devel\include" -Recurse -Force
+          Write-Host "Overlaid custom include/ - headers now match the selected own release"
+
+          # Replace the official lib/ with our custom one (php8ts.lib must
+          # match the exact binary we are building against)
           if (Test-Path "C:\php-devel\lib") { Remove-Item "C:\php-devel\lib" -Recurse -Force }
           Copy-Item -Path $customLib -Destination "C:\php-devel\lib" -Recurse -Force
 
@@ -591,13 +627,13 @@ jobs:
           Get-ChildItem -Path "C:\ImageMagick\bin" -Filter "*.dll" -File | ForEach-Object {
               Copy-Item -Path $_.FullName -Destination "C:\artifact-ts" -Force
           }
-          Compress-Archive -Path "C:\artifact-ts\*" -DestinationPath "imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
+          Compress-Archive -Path "C:\artifact-ts\*" -DestinationPath "imagick-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
 
       - name: Upload TS artifact
         uses: actions/upload-artifact@v6
         with:
-          name: imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
-          path: imagick-php${{ inputs.php_version }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
+          name: imagick-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+          path: imagick-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
           if-no-files-found: error
 
 
@@ -609,6 +645,8 @@ jobs:
     if: ${{ inputs.build_nts }}
     name: Build Imagick PHP NTS x64${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
     runs-on: windows-2025
+    outputs:
+      php_series: ${{ steps.nts_version.outputs.php_series }}
     strategy:
       fail-fast: false
       matrix:
@@ -618,6 +656,15 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Derive PHP series from qa_version
+        id: nts_version
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.qa_version }}"
+          $phpSeries = ($v -split '\.' | Select-Object -First 2) -join '.'
+          Write-Host "qa_version=$v -> PHP series $phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
 
       - name: Verify vendored imagick source is present
         shell: pwsh
@@ -719,7 +766,7 @@ jobs:
 
           Write-Host "imagick source root: C:\imagick-nts"
 
-      - name: Verify PHP 8.6 compatibility patch is present
+      - name: Verify PHP 8.6+ compatibility patch is present
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -733,10 +780,10 @@ jobs:
               throw "The OLD zend_is_callable() call is still present - the vendored zip is not actually patched."
           }
           if (-not $text.Contains('zend_is_callable_ex(user_callback, NULL, 0, NULL, NULL, NULL)')) {
-              throw "The PHP 8.6 compatibility patch (zend_is_callable_ex) was not found."
+              throw "The PHP 8.6+ compatibility patch (zend_is_callable_ex) was not found."
           }
 
-          Write-Host "PHP 8.6 compatibility patch confirmed present."
+          Write-Host "PHP 8.6+ compatibility patch confirmed present."
 
       - name: Extract PHP NTS binary + devel pack
         shell: pwsh
@@ -1003,13 +1050,13 @@ jobs:
           Get-ChildItem -Path "C:\ImageMagick\bin" -Filter "*.dll" -File | ForEach-Object {
               Copy-Item -Path $_.FullName -Destination "C:\artifact-nts" -Force
           }
-          Compress-Archive -Path "C:\artifact-nts\*" -DestinationPath "imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
+          Compress-Archive -Path "C:\artifact-nts\*" -DestinationPath "imagick-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip" -Force
 
       - name: Upload NTS artifact
         uses: actions/upload-artifact@v6
         with:
-          name: imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
-          path: imagick-php${{ inputs.php_version }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
+          name: imagick-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}
+          path: imagick-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts${{ matrix.avx == 'avx2' && '-AVX2' || '' }}.zip
           if-no-files-found: error
 
 
@@ -1018,7 +1065,7 @@ jobs:
   # ============================================================
   release:
     needs: [build-ts, build-nts]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (needs.build-ts.result == 'success' || needs.build-ts.result == 'skipped') && (needs.build-nts.result == 'success' || needs.build-nts.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1039,27 +1086,94 @@ jobs:
       - name: Generate release metadata
         id: meta
         run: |
+          set -eu
           BUILD_DATE=$(date -u +'%Y-%m-%d')
           BUILD_TIME=$(date -u +'%H:%M UTC')
-          TAG="imagick-php${{ inputs.php_version }}-vs18-x64-${BUILD_DATE}"
-          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
-          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
-          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+
+          # Derive everything from the assets that were ACTUALLY built -
+          # never from a free-text input. One PHP series -> imagick-phpX.Y-*;
+          # mixed series (TS and NTS from different series) -> an explicit
+          # multi-version release.
+          VERSIONS=$(ls release_assets | grep -oP '^imagick-php\K[0-9]+\.[0-9]+' | sort -u)
+          VER_COUNT=$(printf '%s\n' "$VERSIONS" | grep -c . || true)
+          if [ "$VER_COUNT" -eq 1 ]; then
+            VER=$(printf '%s\n' "$VERSIONS")
+            TAG="imagick-php${VER}-vs18-x64-${BUILD_DATE}"
+            NAME="Imagick PHP ${VER} VS18 x64 - ${BUILD_DATE}"
+          elif [ "$VER_COUNT" -gt 1 ]; then
+            TAG="imagick-vs18-x64-${BUILD_DATE}"
+            NAME="Imagick VS18 x64 (multi-version) - ${BUILD_DATE}"
+          else
+            echo "ERROR: no imagick-php*.zip assets found in release_assets/" >&2
+            exit 1
+          fi
+
+          # Asset table generated from the real files
+          ASSET_TABLE=""
+          for f in release_assets/*.zip; do
+            base=$(basename "$f" .zip)
+            type="Thread Safe"
+            case "$base" in *-nts-*) type="Non-Thread Safe";; esac
+            opt="Standard"
+            case "$base" in *-AVX2) opt="AVX2";; esac
+            use="Apache mod_php / XAMPP"
+            if [ "$type" = "Non-Thread Safe" ]; then use="IIS / Nginx FastCGI"; fi
+            ASSET_TABLE="${ASSET_TABLE}| \`${base}.zip\` | ${type} | ${opt} | ${use} |"$'\n'
+          done
+
+          # Version line from what the build jobs actually used
+          TS_TAG='${{ needs.build-ts.outputs.release_tag }}'
+          TS_SERIES='${{ needs.build-ts.outputs.php_series }}'
+          NTS_SERIES='${{ needs.build-nts.outputs.php_series }}'
+          QA_VER='${{ inputs.qa_version }}'
+          TS_PART=""
+          if [ -n "$TS_TAG" ]; then TS_PART="**TS**: own release \`${TS_TAG}\` (PHP ${TS_SERIES})"; fi
+          NTS_PART=""
+          if [ -n "$NTS_SERIES" ]; then NTS_PART="**NTS**: official php.net QA \`php-${QA_VER}\` (PHP ${NTS_SERIES})"; fi
+          if [ -n "$TS_PART" ] && [ -n "$NTS_PART" ]; then
+            VERSION_LINE="${TS_PART} · ${NTS_PART}"
+          elif [ -n "$TS_PART" ]; then
+            VERSION_LINE="$TS_PART"
+          elif [ -n "$NTS_PART" ]; then
+            VERSION_LINE="$NTS_PART"
+          else
+            VERSION_LINE="none (both variants were disabled)"
+          fi
+
+          REQ_LINE="The TS DLL requires the TS PHP build it was compiled against; the NTS DLL requires the official php-${QA_VER} NTS build or a newer one of the same series."
+
+          {
+            echo "tag_name=${TAG}"
+            echo "name=${NAME}"
+            echo "build_date=${BUILD_DATE}"
+            echo "build_time=${BUILD_TIME}"
+            echo "version_line<<METADATA_EOF"
+            printf '%s' "$VERSION_LINE"
+            echo ""
+            echo "METADATA_EOF"
+            echo "requirement_line<<METADATA_EOF"
+            printf '%s' "$REQ_LINE"
+            echo ""
+            echo "METADATA_EOF"
+            echo "asset_table<<METADATA_EOF"
+            printf '%s' "$ASSET_TABLE"
+            echo "METADATA_EOF"
+          } >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag_name }}
-          name: Imagick PHP ${{ inputs.php_version }} VS18 x64 - ${{ steps.meta.outputs.build_date }}
+          name: ${{ steps.meta.outputs.name }}
           body: |
-            # Imagick extension for PHP ${{ inputs.php_version }} - VS2024 x64 builds
+            # Imagick extension for PHP - VS2024 x64 builds
 
             | Field | Value |
             |---|---|
             | **Build date** | ${{ steps.meta.outputs.build_date }} ${{ steps.meta.outputs.build_time }} |
             | **Compiler** | Visual Studio 2024 (VC18, vs18) |
             | **Runner** | windows-2025 |
-            | **PHP version** | ${{ inputs.php_version }} (TS: latest from own releases; NTS: official QA ${{ inputs.qa_version }}) |
+            | **PHP version** | ${{ steps.meta.outputs.version_line }} |
             | **ImageMagick** | 7.1.1-47 |
             | **Variants** | TS + NTS + AVX2 |
 
@@ -1069,10 +1183,7 @@ jobs:
 
             | Asset | Type | Optimization | Use case |
             |---|---|---|---|
-            | `imagick-php${{ inputs.php_version }}-vs18-x64-ts.zip` | Thread Safe | Standard | Apache mod_php / XAMPP |
-            | `imagick-php${{ inputs.php_version }}-vs18-x64-ts-AVX2.zip` | Thread Safe | AVX2 | Apache mod_php with AVX2 CPU |
-            | `imagick-php${{ inputs.php_version }}-vs18-x64-nts.zip` | Non-Thread Safe | Standard | IIS / Nginx FastCGI |
-            | `imagick-php${{ inputs.php_version }}-vs18-x64-nts-AVX2.zip` | Non-Thread Safe | AVX2 | FastCGI with AVX2 CPU |
+            ${{ steps.meta.outputs.asset_table }}
 
             ## Installation
 
@@ -1088,7 +1199,7 @@ jobs:
 
             ## Requirements
 
-            - PHP ${{ inputs.qa_version }} or newer, matching the built variant (TS or NTS)
+            - ${{ steps.meta.outputs.requirement_line }}
             - For AVX2 builds: Intel Haswell (2013+) or AMD Ryzen (2017+) CPU
             - Windows x64 (10/11, Server 2016+)
 
