@@ -47,6 +47,16 @@ name: Build MySQL extension PHP VS18 x64 (from own releases)
 #   only mysqlnd_connection_init/connect + mysqlnd_get_client_info +
 #   mysqlnd_old_escape_string (all present in 8.6 and 8.7).
 #
+#   TS C17 SHIM: PHP 8.7 headers require C11 or later (Zend/zend_portability.h
+#   #errors without __STDC_VERSION__ >= 201112L), but the official 8.6-era
+#   QA phpize build system used as the base does not pass any /std: flag,
+#   so compiling our overlaid 8.7 headers dies with C1189. When the TS
+#   target series is >= 8.7, the build task therefore injects
+#   /std:c17 /experimental:c11atomics (the exact flags php-src master's
+#   own confutils.js ADD_SOURCES uses) via the MSVC _CL_ environment
+#   variable. The NTS variant is built entirely from the QA pack of one
+#   era and never needs this.
+#
 # WHY ONLY TS + NTS (no AVX2 variants): php_mysql.dll is pure C with no
 # CPU-dispatched code; it is ABI-identical for the AVX2 and standard PHP
 # builds of the same series and the same ZEND_MODULE_API_NO (php.net
@@ -431,7 +441,14 @@ jobs:
           } catch {
               Write-Host "WARNING: could not parse PHP series '$series' as a version - skipping reverse-API import check."
           }
-          Write-Host "PHP series: $series -> CHECK_REVERSE_API=$checkReverseApi"
+          # PHP 8.7 headers require C11+ (Zend/zend_portability.h errors out
+          # otherwise), but the official 8.6-era QA phpize build system we
+          # use as a base does not pass /std: to cl.exe. Inject the C17 flags
+          # (exactly what php-src master's own confutils.js adds) via the
+          # documented MSVC _CL_ environment variable - cl.exe appends it to
+          # every invocation. Only needed when OUR overlaid headers are 8.7+.
+          $needC17 = $checkReverseApi
+          Write-Host "PHP series: $series -> CHECK_REVERSE_API=$checkReverseApi, NEED_C17=$needC17"
 
           $build = @'
           @echo off
@@ -440,6 +457,15 @@ jobs:
           set "PHP_DEV=C:\php-devel"
           set "SOURCE=C:\mysql-ts"
           set "CHECK_REVERSE_API=${CHECK_REVERSE_API}"
+          set "NEED_C17=${NEED_C17}"
+
+          if "%NEED_C17%"=="1" (
+              REM PHP 8.7 headers require C11+; the 8.6-era phpize build
+              REM system does not pass /std: itself. _CL_ is appended to
+              REM every cl.exe invocation by the MSVC driver.
+              set "_CL_=/std:c17 /experimental:c11atomics"
+              echo Injecting C17 compiler flags via _CL_ for PHP 8.7+ headers
+          )
 
           echo ========================================
           echo PHP TS x64 / ext/mysql (legacy)
@@ -569,8 +595,9 @@ jobs:
           '@
 
           $build = $build -replace '\$\{CHECK_REVERSE_API\}', $checkReverseApi
+          $build = $build -replace '\$\{NEED_C17\}', $needC17
           Set-Content -Path "C:\build-mysql-ts.bat" -Value $build -Encoding ASCII
-          Write-Host "TS build task created (CHECK_REVERSE_API=$checkReverseApi)."
+          Write-Host "TS build task created (CHECK_REVERSE_API=$checkReverseApi, NEED_C17=$needC17)."
 
       - name: Build MySQL TS
         shell: cmd
