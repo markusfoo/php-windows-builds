@@ -62,7 +62,7 @@ The [`build-imagick`](.github/workflows/build-imagick.yaml) workflow builds `php
   - an exact tag, e.g. `php-8.6.0RC2`
 
   Artifact and release labels are derived from the release that was **actually used**, so they can never lie.
-- **NTS variant** — compiled against the official [windows.php.net](https://windows.php.net) QA build selected by `qa_version` (default `8.6.0RC2`), labeled accordingly.
+- **NTS variant** — compiled against the official [windows.php.net](https://windows.php.net) QA build selected by `qa_version` (default `8.6.0RC3`), labeled accordingly.
 
 If the TS and NTS variants end up on different PHP series, the release is published as an explicit **multi-version** release and every asset carries its own version in the filename.
 
@@ -82,12 +82,50 @@ PHP checks `ZEND_MODULE_API_NO` when an extension is loaded, so headers, import 
 
 ---
 
+## 3. MySQL extension (legacy ext/mysql) — patched, follows any PHP ≥ 8.6
+
+The [`build-mysql`](.github/workflows/build-mysql.yaml) workflow builds `php_mysql.dll` — the classic `mysql_*` API from PHP 3-5 (removed from the core in PHP 7, maintained as [php/pecl-database-mysql](https://github.com/php/pecl-database-mysql)) — x64, Thread Safe + Non-Thread Safe, following whichever PHP you build, exactly like Imagick:
+
+- **TS variant** — compiled against a PHP release from this repository, selected by the `php_release` input (`latest` *(default)* / a series like `8.6` or `8.7` / an exact tag)
+- **NTS variant** — compiled against the official php.net QA build selected by `qa_version` (default `8.6.0RC3`), labeled accordingly
+
+No AVX2 variants: `php_mysql.dll` is pure C and ABI-identical for the AVX2 and standard builds of a series (php.net also ships its PECL extension DLLs per TS/NTS only) — one DLL per variant covers both.
+
+### Why the patch is needed
+
+PHP 8.7 removed the mysqlnd reverse API (php/php-src PR #21409, commit `58b4cc2df0`, 2026-09-30). Every `php_mysql.dll` built against PHP ≤ 8.6 imports `mysqlnd_reverse_api_register_api` from `php8ts.dll` and dies at load time on PHP 8.7 with:
+
+> `httpd.exe - Entry Point Not Found`
+> `The procedure entry point mysqlnd_reverse_api_register_api could not be located in the dynamic link library …\ext\php_mysql.dll`
+
+— taking Apache down with it (and unpatched source does not even compile for 8.7: the header is gone).
+
+The registration only existed so mysqli / PDO_MYSQL could accept foreign `mysql_*` connection resources via `zval_to_mysqlnd()`; those consumers dropped the feature upstream in the same commit, so skipping it on 8.7+ is lossless — ext/mysql keeps working through its own resource handling.
+
+On top of that, current php-src (both the PHP-8.6 branch and master) also removed `zval_dtor()` and `zend_exception_get_default()` from the public API and changed `php_get_current_user()` to return a `zend_string*` — unpatched pecl-database-mysql master does not compile against current 8.6 **or** 8.7 at all.
+
+The vendored, pre-patched source (`vendor/mysql-patched.zip`) fixes all four issues:
+
+| Upstream change | Patch |
+|---|---|
+| 8.7 removed the mysqlnd reverse API (`mysqlnd_reverse_api_register_api` et al.) | registration guarded with `#if PHP_VERSION_ID < 80700` (kept for 8.6, skipped on 8.7+) |
+| `zval_dtor()` removed from the public API (8.6 + 8.7) | `zval_ptr_dtor()` — correct for a value we own |
+| `zend_exception_get_default()` removed (8.6 + 8.7) | `zend_ce_exception` — direct class-entry access |
+| `php_get_current_user()` now returns `zend_string*` (8.6 + 8.7) | `ZSTR_VAL(...)` — the result is SAPI-cached for the request, so borrowing is safe |
+
+— **one source builds unchanged for 8.6 and 8.7+** (verified locally by compiling against a fresh php-src master build: zero errors, clean load, no `mysqlnd_reverse_api_*` imports). The workflow fail-fast-verifies all fixes are present before compiling and, for PHP ≥ 8.7 targets, additionally verifies via `dumpbin` that the produced DLL imports no `mysqlnd_reverse_api_*` symbol — the exact import that crashed Apache.
+
+**Trigger:** Actions → **Build MySQL extension PHP VS18 x64 (from own releases)** → Run workflow.
+
+---
+
 ## Workflows
 
 | Workflow | Builds | Output |
 |---|---|---|
 | `build-php-dev-latest` | full PHP distro, any php/php-src ref, version auto-detected | GitHub Release (zips + devel pack) |
 | `build-imagick` | patched `php_imagick.dll` — TS from own releases, NTS from official QA | GitHub Release (zips) |
+| `build-mysql` | patched `php_mysql.dll` (legacy ext/mysql) — TS from own releases, NTS from official QA | GitHub Release (zips) |
 
 ## Source
 
@@ -97,6 +135,12 @@ PHP checks `ZEND_MODULE_API_NO` when an extension is loaded, so headers, import 
 - Ubuntu .deb builds: [markusfoo/php-apt-builder](https://github.com/markusfoo/php-apt-builder)
 
 ## Changelog
+
+### 2026-10-09 — MySQL (legacy ext/mysql) extension + php.net QA 8.6.0RC3
+
+- PHP 8.7 removed the mysqlnd reverse API (php/php-src PR #21409, commit `58b4cc2df0`, 2026-09-30). Every `php_mysql.dll` compiled against PHP ≤ 8.6 imports `mysqlnd_reverse_api_register_api` from `php8ts.dll` and kills Apache at startup on 8.7 with "Entry Point Not Found" (observed live on XAMPP-Lite 8.7.0). New **`build-mysql.yaml`** + vendored patched source (**`vendor/mysql-patched.zip`**) fix this exactly the way Imagick was fixed for 8.6. The patch covers FOUR upstream API removals: the 8.7 mysqlnd reverse-API removal (registration version-guarded with `#if PHP_VERSION_ID < 80700`), plus `zval_dtor()` → `zval_ptr_dtor()`, `zend_exception_get_default()` → `zend_ce_exception` and the `zend_string*` return of `php_get_current_user()` — the latter three removed/changed in the PHP-8.6 branch as well, so unpatched pecl-database-mysql master compiles against current neither 8.6 nor 8.7. Verified locally against a fresh php-src master (8.7.0-dev) build before pushing; TS builds against own releases, NTS against the official php.net QA build, with fail-fast patch verification and — for PHP ≥ 8.7 targets — a `dumpbin` check that the DLL imports no `mysqlnd_reverse_api_*` symbol. No AVX2 variants: the DLL is pure C and ABI-identical across the AVX2/standard PHP builds of a series (php.net ships PECL DLLs per TS/NTS only).
+- `build-imagick.yaml` default `qa_version` bumped `8.6.0RC2` → `8.6.0RC3` — php.net deleted the RC2 QA packages, so the old default would 404 on a fresh run.
+- README: documented the MySQL extension; fixed the broken php-apt-builder link.
 
 ### 2026-09-26 — universal builds (PHP 8.7.0-dev era) + repository renamed to `php-windows-builds`
 

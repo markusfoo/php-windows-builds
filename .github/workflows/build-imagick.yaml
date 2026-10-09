@@ -64,9 +64,9 @@ on:
         type: string
         default: "latest"
       qa_version:
-        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC2)"
+        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC3)"
         type: string
-        default: "8.6.0RC2"
+        default: "8.6.0RC3"
 
 permissions:
   contents: read

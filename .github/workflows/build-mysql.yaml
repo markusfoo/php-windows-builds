@@ -1,0 +1,1215 @@
+name: Build MySQL extension PHP VS18 x64 (from own releases)
+
+# ============================================================================
+# LEGACY ext/mysql (php_mysql.dll) -- the PHP 3-5 mysql_* API as a PECL
+# extension (github.com/php/pecl-database-mysql), built with the same method
+# as build-imagick.yaml: vendored, pre-patched source + own PHP releases.
+#
+# ROOT CAUSE of the XAMPP crash this workflow fixes (verified directly
+# against php/php-src master and the PECL source -- not a guess):
+#
+#   php/php-src removed the mysqlnd reverse API in PHP 8.7 (PR #21409,
+#   commit 58b4cc2df0, 2026-09-30): ext/mysqlnd/mysqlnd_reverse_api.[ch],
+#   the MYSQLND_REVERSE_API struct, mysqlnd_reverse_api_register_api(),
+#   mysqlnd_reverse_api_get_api_list() and zval_to_mysqlnd() no longer
+#   exist, and mysqli / PDO_MYSQL dropped their registrations in the same
+#   commit.
+#
+#   Every php_mysql.dll built against PHP <= 8.6 (e.g. one built
+#   2026-08-17 against 8.6.0-dev) imports mysqlnd_reverse_api_register_api
+#   from php8ts.dll and therefore dies at load time on PHP 8.7 with:
+#
+#     httpd.exe - Entry Point Not Found
+#     The procedure entry point mysqlnd_reverse_api_register_api could not
+#     be located in the dynamic link library ...\ext\php_mysql.dll
+#
+#   ...and Apache fails to start. A DLL built from unpatched source cannot
+#   even be COMPILED for 8.7 (the header is gone).
+#
+#   The registration only existed so mysqli / PDO_MYSQL could accept
+#   foreign mysql_* connection resources via zval_to_mysqlnd(); those
+#   consumers dropped the feature upstream, so on 8.7+ not registering is
+#   both required and lossless: ext/mysql keeps working through its own
+#   resource handling (zend_fetch_resource2). The vendored patch
+#   (vendor/mysql-patched.zip) guards the whole registration block with
+#   `#if PHP_VERSION_ID < 80700`, so the SAME source still builds
+#   completely unchanged for 8.6 and older (the NTS variant below).
+#
+#   In addition, current php-src (both the PHP-8.6 branch and master)
+#   removed zval_dtor() and zend_exception_get_default() from the public
+#   API and changed php_get_current_user() to return a zend_string* --
+#   unpatched pecl-database-mysql master does not compile against
+#   current 8.6 OR 8.7 at all. The vendored patch also fixes those three
+#   (zval_ptr_dtor, zend_ce_exception, ZSTR_VAL) in a way that stays
+#   compatible with every PHP that still had the old API. All of this was
+#   verified locally by compiling the patched source against a fresh
+#   php-src master (8.7.0-dev) build: zero errors, loads cleanly, imports
+#   only mysqlnd_connection_init/connect + mysqlnd_get_client_info +
+#   mysqlnd_old_escape_string (all present in 8.6 and 8.7).
+#
+# WHY ONLY TS + NTS (no AVX2 variants): php_mysql.dll is pure C with no
+# CPU-dispatched code; it is ABI-identical for the AVX2 and standard PHP
+# builds of the same series and the same ZEND_MODULE_API_NO (php.net
+# ships its PECL extension DLLs per TS/NTS, never per AVX2). Shipping
+# differently-labeled copies of the same binary would be dishonest
+# labeling, which this repository does not do.
+#
+# LIKE IMAGICK, THIS WORKFLOW NEEDS ONE VENDORED FILE IN THE REPO:
+#
+#   vendor/mysql-patched.zip   <- patched pecl-database-mysql source
+#
+# The build fail-fast-verifies the patch is present before compiling, and
+# the TS job additionally verifies via dumpbin that the produced DLL does
+# NOT import any mysqlnd_reverse_api_* symbol (the exact import that
+# crashes Apache on 8.7).
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ts:
+        description: "Build Thread-Safe (TS) variant"
+        type: boolean
+        default: true
+      build_nts:
+        description: "Build Non-Thread-Safe (NTS) variant"
+        type: boolean
+        default: true
+      php_release:
+        description: "Own-repo PHP release the TS variant builds against: 'latest' (newest php-* release with assets), a series ('8.6', '8.7') or an exact tag ('php-8.7.0-dev-2026-10-09')"
+        type: string
+        default: "latest"
+      qa_version:
+        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC3)"
+        type: string
+        default: "8.6.0RC3"
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ============================================================
+  # BUILD THREAD SAFE
+  # ============================================================
+
+  build-ts:
+    if: ${{ inputs.build_ts }}
+    name: Build MySQL PHP TS x64
+    runs-on: windows-2025
+    outputs:
+      php_series: ${{ steps.select_release.outputs.php_series }}
+      release_tag: ${{ steps.select_release.outputs.release_tag }}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Verify vendored mysql source is present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = "vendor\mysql-patched.zip"
+          if (-not (Test-Path $f)) {
+              throw "Missing required vendored file: $f -- upload it to the repo first (see comments at the top of this workflow)."
+          }
+          Write-Host "Found: $f"
+
+      # --------------------------------------------------------
+      # Downloads (PHP SDK from GitHub + PHP binary/devel pack from
+      # own releases + official QA devel pack for its script/).
+      # --------------------------------------------------------
+
+      - name: Download PHP TS binary + devel pack from own releases
+        id: select_release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Get-FileWithRetry {
+              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
+
+              for ($i = 1; $i -le $Retries; $i++) {
+                  try {
+                      Write-Host "[$i/$Retries] Downloading: $Url"
+                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
+
+                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
+                      $size = (Get-Item $OutFile).Length
+                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
+
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem
+                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
+                      $zip.Dispose()
+
+                      Write-Host "OK ($size bytes)."
+                      return
+                  } catch {
+                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
+                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
+                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
+                  }
+              }
+              throw "Failed to download a valid archive from $Url after $Retries attempts."
+          }
+
+          # Select the own-repo release to build the TS variant against,
+          # per the php_release input:
+          #   'latest'       -> newest php-* release that has assets
+          #   '8.6' / '8.7'  -> newest release of that series (tag prefix php-8.6.)
+          #   'php-8.7.0-dev-2026-10-09' -> that exact tag
+          $headers = @{ "Authorization" = "Bearer $env:GH_TOKEN"; "Accept" = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/markusfoo/php-windows-builds/releases?per_page=30" -Headers $headers
+          $candidates = $releases | Where-Object { $_.prerelease -and $_.assets.Count -gt 0 -and $_.tag_name -match '^php-' }
+          if (-not $candidates) { throw "No php-* release with assets found in markusfoo/php-windows-builds - run the build-php-dev-latest workflow first." }
+
+          $wanted = "${{ inputs.php_release }}"
+          if ($wanted -eq "latest") {
+              $release = $candidates | Select-Object -First 1
+          } else {
+              $prefix = if ($wanted -match '^php-') { $wanted } else { "php-$wanted" }
+              $release = $candidates | Where-Object { $_.tag_name -eq $wanted -or $_.tag_name.StartsWith("$prefix.") } | Select-Object -First 1
+              if (-not $release) { throw "No own-repo release matches php_release='$wanted'. Available: $($candidates.tag_name -join ', ')" }
+          }
+
+          # Derive the PHP series from the selected tag (php-8.7.0-dev-2026-09-26 -> 8.7)
+          # so artifact and release naming always reflects what was ACTUALLY built.
+          $phpSeries = (($release.tag_name -replace '^php-', '') -split '\.' | Select-Object -First 2) -join '.'
+          Write-Host "Using release: $($release.tag_name) ($($release.assets.Count) assets) -> PHP series $phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_tag=$($release.tag_name)"
+
+          # Find the right assets
+          $phpBin = $release.assets | Where-Object { $_.name -match '^php-.*-ts-Win32-vs18-x64\.zip$' -and $_.name -notmatch 'AVX2' -and $_.name -notmatch 'devel' } | Select-Object -First 1
+          $develPack = $release.assets | Where-Object { $_.name -match 'devel' } | Select-Object -First 1
+
+          if (-not $phpBin) { throw "PHP TS x64 binary not found in release $($release.tag_name). Available: $($release.assets | ForEach-Object { $_.name })" }
+          if (-not $develPack) { throw "Devel pack not found in release $($release.tag_name). Available: $($release.assets | ForEach-Object { $_.name })" }
+
+          Write-Host "PHP binary: $($phpBin.name) ($([math]::Round($phpBin.size/1MB, 1)) MB)"
+          Write-Host "Devel pack: $($develPack.name) ($([math]::Round($develPack.size/1MB, 1)) MB)"
+
+          Get-FileWithRetry -Url $phpBin.browser_download_url -OutFile "php-ts.zip"
+          Get-FileWithRetry -Url $develPack.browser_download_url -OutFile "php-devel.zip"
+
+          # Our custom devel pack is missing script/ (phpize.js etc.) because
+          # buildconf doesn't generate it for dev builds. Download the official
+          # QA devel pack to steal its script/ directory (its ext_deps.js is
+          # what makes ADD_EXTENSION_DEP('mysql', 'mysqlnd') resolve, since
+          # mysqlnd is statically built into php8ts.dll).
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-${{ inputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
+
+      # --------------------------------------------------------
+      # Download + extract PHP SDK from GitHub
+      # --------------------------------------------------------
+
+      - name: Download and extract PHP SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          for ($i = 1; $i -le 5; $i++) {
+              try {
+                  Write-Host "[$i/5] Downloading PHP SDK from GitHub..."
+                  Invoke-WebRequest -Uri "https://github.com/php/php-sdk-binary-tools/archive/refs/heads/master.zip" -OutFile "sdk.zip" -UseBasicParsing
+                  break
+              } catch {
+                  Write-Host "Attempt $i failed: $($_.Exception.Message)"
+                  if ($i -eq 5) { throw "Failed to download PHP SDK from GitHub after 5 attempts." }
+                  Start-Sleep -Seconds (5 * $i)
+              }
+          }
+
+          if (Test-Path "C:\php-sdk") { Remove-Item "C:\php-sdk" -Recurse -Force }
+          New-Item -ItemType Directory -Path "C:\php-sdk-extract" -Force | Out-Null
+          Expand-Archive -Path "sdk.zip" -DestinationPath "C:\php-sdk-extract" -Force
+
+          $root = Get-ChildItem -Path "C:\php-sdk-extract" -Directory | Select-Object -First 1
+          if (-not $root) { throw "PHP SDK archive root was not found." }
+          Move-Item -Path $root.FullName -Destination "C:\php-sdk" -Force
+
+          $starter = Get-ChildItem -Path "C:\php-sdk" -Recurse -Filter "phpsdk-vs18-x64.bat" | Select-Object -First 1
+          if (-not $starter) { throw "phpsdk-vs18-x64.bat not found in downloaded SDK." }
+
+          $bison = Get-ChildItem -Path "C:\php-sdk" -Recurse -Filter "bison.exe" | Select-Object -First 1
+          if (-not $bison) { throw "bison.exe not found in downloaded SDK." }
+
+          Write-Host "SDK starter: $($starter.FullName)"
+          Write-Host "bison.exe:   $($bison.FullName)"
+
+      # --------------------------------------------------------
+      # Extract vendored, already-patched mysql source
+      # --------------------------------------------------------
+
+      - name: Extract mysql source (vendored, pre-patched) - TS copy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "C:\mysql-ts") { Remove-Item "C:\mysql-ts" -Recurse -Force }
+          New-Item -ItemType Directory -Path "C:\mysql-ts-raw" -Force | Out-Null
+
+          Expand-Archive -Path "vendor\mysql-patched.zip" -DestinationPath "C:\mysql-ts-raw" -Force
+
+          $configw32 = Get-ChildItem -Path "C:\mysql-ts-raw" -Recurse -Filter "config.w32" | Select-Object -First 1
+          if (-not $configw32) { throw "config.w32 not found inside vendored mysql source zip." }
+
+          Move-Item -Path $configw32.Directory.FullName -Destination "C:\mysql-ts" -Force
+
+          Write-Host "mysql source root: C:\mysql-ts"
+
+      - name: Verify PHP 8.7+ compatibility patch is present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = "C:\mysql-ts\php_mysql.c"
+          if (-not (Test-Path $source)) { throw "php_mysql.c not found." }
+
+          $text = Get-Content -Path $source -Raw
+
+          if ($text -match '#ifdef MYSQL_USE_MYSQLND\r?\n\tmysqlnd_reverse_api_register_api') {
+              throw "An UNGUARDED mysqlnd_reverse_api_register_api() call is still present - this DLL will import the symbol and crash Apache on PHP 8.7 with 'Entry Point Not Found'. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('#if PHP_VERSION_ID < 80700'))) {
+              throw "The PHP 8.7 version guard (#if PHP_VERSION_ID < 80700) around the reverse-API registration was not found. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('#if defined(MYSQL_USE_MYSQLND) && PHP_VERSION_ID < 80700'))) {
+              throw "The version guard on the mysqlnd_reverse_api_register_api() MINIT call was not found. The vendored zip is not actually patched."
+          }
+
+          if ($text.Contains('zval_dtor(')) {
+              throw "zval_dtor() is still referenced - it was removed from the public PHP API and does not compile on current 8.6/8.7. The vendored zip is not actually patched."
+          }
+
+          if ($text.Contains('zend_exception_get_default(')) {
+              throw "zend_exception_get_default() is still referenced - it was removed and does not compile on current 8.6/8.7. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('ZSTR_VAL(php_get_current_user())'))) {
+              throw "The zend_string migration of php_get_current_user() was not found. The vendored zip is not actually patched."
+          }
+
+          Write-Host "PHP 8.6/8.7 compatibility patch confirmed present (reverse-API guard + zval_dtor + zend_ce_exception + php_get_current_user fixes)."
+
+      # --------------------------------------------------------
+      # Extract PHP binary + devel pack
+      # --------------------------------------------------------
+
+      - name: Extract PHP TS binary + devel pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "C:\php-bin")   { Remove-Item "C:\php-bin" -Recurse -Force }
+          if (Test-Path "C:\php-devel") { Remove-Item "C:\php-devel" -Recurse -Force }
+
+          # === PHP binary from our own release ===
+          New-Item -ItemType Directory -Path "C:\php-bin" -Force | Out-Null
+          Expand-Archive -Path "php-ts.zip" -DestinationPath "C:\php-bin" -Force
+
+          # Our release zips wrap contents in a subdirectory. Flatten if needed.
+          $php = "C:\php-bin\php.exe"
+          if (-not (Test-Path $php)) {
+              $found = Get-ChildItem -Path "C:\php-bin" -Recurse -Filter "php.exe" | Select-Object -First 1
+              if (-not $found) { throw "php.exe not found anywhere in the extracted PHP TS binary." }
+              $innerDir = $found.Directory.FullName
+              Write-Host "Flattening: php.exe is in $innerDir, moving contents to C:\php-bin"
+              Get-ChildItem -Path $innerDir | Move-Item -Destination "C:\php-bin" -Force
+              if ((Get-ChildItem -Path $innerDir -ErrorAction SilentlyContinue).Count -eq 0) {
+                  Remove-Item $innerDir -Force
+              }
+          }
+          $php = "C:\php-bin\php.exe"
+          if (-not (Test-Path $php)) { throw "php.exe not found after extracting PHP TS binary." }
+          & $php -v
+
+          # === Devel pack: use OFFICIAL QA as base, overlay our custom lib/ ===
+          # Our custom devel pack is incomplete (missing script/, win32/ headers).
+          # The official QA pack has everything needed for compilation.
+          # Strategy: extract official pack -> C:\php-devel, then replace lib/ with
+          # our custom lib/ (so .lib files match our exact dev binary).
+          Write-Host ""
+          Write-Host "=== Extracting OFFICIAL QA devel pack as base ==="
+          New-Item -ItemType Directory -Path "C:\php-devel-official-extract" -Force | Out-Null
+          Expand-Archive -Path "php-devel-official.zip" -DestinationPath "C:\php-devel-official-extract" -Force
+
+          # Official packs have a subdirectory wrapper. Find phpize.bat and flatten.
+          $phpize = Get-ChildItem -Path "C:\php-devel-official-extract" -Recurse -Filter "phpize.bat" | Select-Object -First 1
+          if (-not $phpize) { throw "phpize.bat not found in the official QA devel pack." }
+          $officialDevelDir = $phpize.Directory.FullName
+          Write-Host "Official devel pack root: $officialDevelDir"
+
+          Move-Item -Path $officialDevelDir -Destination "C:\php-devel" -Force
+
+          # Verify the official pack has what we need
+          if (-not (Test-Path "C:\php-devel\phpize.bat")) { throw "phpize.bat not at C:\php-devel\phpize.bat" }
+          if (-not (Test-Path "C:\php-devel\script\phpize.js")) { throw "script/phpize.js missing from official pack." }
+          if (-not (Test-Path "C:\php-devel\script\ext_deps.js")) { throw "script/ext_deps.js missing from official pack (needed so ADD_EXTENSION_DEP('mysql','mysqlnd') resolves)." }
+          if (-not (Test-Path "C:\php-devel\include\main\php.h")) {
+              Write-Host "WARNING: include/main/php.h not directly present, checking subdirs..."
+              $h = Get-ChildItem -Path "C:\php-devel" -Recurse -Filter "php.h" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match '\\main\\' } | Select-Object -First 1
+              if (-not $h) { throw "php.h not found in official devel pack." }
+              $innerInclude = $h.Directory.Parent.FullName
+              if (-not (Test-Path "C:\php-devel\include")) {
+                  Move-Item -Path $innerInclude -Destination "C:\php-devel\include" -Force
+              }
+          }
+
+          Write-Host "Official pack verified. Contents:"
+          Write-Host "  phpize.bat:  $(Test-Path 'C:\php-devel\phpize.bat')"
+          Write-Host "  script/:     $(Test-Path 'C:\php-devel\script')"
+          Write-Host "  include/:    $(Test-Path 'C:\php-devel\include')"
+          Write-Host "  lib/:        $(Test-Path 'C:\php-devel\lib')"
+          Write-Host "  build/:      $(Test-Path 'C:\php-devel\build')"
+
+          # === Overlay our custom lib/ (matching .lib files for our dev binary) ===
+          Write-Host ""
+          Write-Host "=== Overlaying custom lib/ from our release devel pack ==="
+          New-Item -ItemType Directory -Path "C:\php-devel-custom-extract" -Force | Out-Null
+          Expand-Archive -Path "php-devel.zip" -DestinationPath "C:\php-devel-custom-extract" -Force
+
+          $customPhpize = Get-ChildItem -Path "C:\php-devel-custom-extract" -Recurse -Filter "phpize.bat" | Select-Object -First 1
+          if (-not $customPhpize) { throw "phpize.bat not found in our custom devel pack." }
+          $customDevelDir = $customPhpize.Directory.FullName
+          $customLib = "$customDevelDir\lib"
+          if (-not (Test-Path $customLib)) { throw "lib/ not found in our custom devel pack." }
+
+          Write-Host "Custom lib contents:"
+          Get-ChildItem -Path $customLib -File | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1KB, 0)) KB)" }
+
+          # Overlay our custom include/ on top of the official pack. The
+          # headers MUST come from the exact PHP we build against: PHP checks
+          # ZEND_MODULE_API_NO at extension load time (8.6 = 20260924,
+          # 8.7.0-dev = 20260925), so a DLL compiled against the QA headers
+          # of a different series would fail to load. Merging (not replacing)
+          # keeps official-only extras (script/, win32/) that our pack does
+          # not ship.
+          $customInclude = "$customDevelDir\include"
+          if (-not (Test-Path $customInclude)) { throw "include/ not found in our custom devel pack." }
+          Copy-Item -Path "$customInclude\*" -Destination "C:\php-devel\include" -Recurse -Force
+          Write-Host "Overlaid custom include/ - headers now match the selected own release"
+
+          # Replace the official lib/ with our custom one (php8ts.lib must
+          # match the exact binary we are building against)
+          if (Test-Path "C:\php-devel\lib") { Remove-Item "C:\php-devel\lib" -Recurse -Force }
+          Copy-Item -Path $customLib -Destination "C:\php-devel\lib" -Recurse -Force
+
+          # Final verification
+          $tsLib = "C:\php-devel\lib\php8ts.lib"
+          if (-not (Test-Path $tsLib)) { throw "php8ts.lib not found after lib overlay. Our custom devel pack may not have it." }
+          Write-Host ""
+          Write-Host "=== Final C:\php-devel structure ==="
+          Write-Host "  phpize.bat:  OK"
+          Write-Host "  script/:     OK ($(Get-ChildItem 'C:\php-devel\script' -File | Measure-Object).Count files)"
+          Write-Host "  include/:    OK"
+          Write-Host "  lib/:        OK ($(Get-ChildItem 'C:\php-devel\lib' -File | Measure-Object).Count files)"
+          Write-Host "  php8ts.lib: OK ($([math]::Round((Get-Item $tsLib).Length/1MB, 2)) MB)"
+
+      # --------------------------------------------------------
+      # Build task
+      # --------------------------------------------------------
+
+      - name: Create TS build task
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # For PHP >= 8.7 the built DLL must NOT import any
+          # mysqlnd_reverse_api_* symbol (removed upstream in PR #21409) -
+          # that import is exactly what crashes Apache with
+          # "Entry Point Not Found". dumpbin verifies this hard.
+          $series = '${{ steps.select_release.outputs.php_series }}'
+          $checkReverseApi = "0"
+          try {
+              if ([version]$series -ge [version]"8.7") { $checkReverseApi = "1" }
+          } catch {
+              Write-Host "WARNING: could not parse PHP series '$series' as a version - skipping reverse-API import check."
+          }
+          Write-Host "PHP series: $series -> CHECK_REVERSE_API=$checkReverseApi"
+
+          $build = @'
+          @echo off
+          setlocal EnableExtensions EnableDelayedExpansion
+
+          set "PHP_DEV=C:\php-devel"
+          set "SOURCE=C:\mysql-ts"
+          set "CHECK_REVERSE_API=${CHECK_REVERSE_API}"
+
+          echo ========================================
+          echo PHP TS x64 / ext/mysql (legacy)
+          echo ========================================
+          echo PHP_DEV:      %PHP_DEV%
+          echo SOURCE:       %SOURCE%
+
+          where cl    >nul || (echo ERROR: cl.exe not found & exit /b 1)
+          where link  >nul || (echo ERROR: link.exe not found & exit /b 1)
+          where nmake >nul || (echo ERROR: nmake.exe not found & exit /b 1)
+          where dumpbin >nul || (echo ERROR: dumpbin.exe not found & exit /b 1)
+
+          if not exist "%PHP_DEV%\phpize.bat" (echo ERROR: phpize.bat missing & exit /b 1)
+          if not exist "%PHP_DEV%\include\main\php.h" (echo ERROR: PHP headers missing & exit /b 1)
+          if not exist "%PHP_DEV%\include\ext\mysqlnd\mysqlnd.h" (echo ERROR: mysqlnd headers missing & exit /b 1)
+
+          cd /d "%SOURCE%"
+          if errorlevel 1 (echo ERROR: cannot cd into source & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo PHPIZE
+          echo ========================================
+          call "%PHP_DEV%\phpize.bat"
+          if errorlevel 1 (echo PHPIZE FAILED & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo CONFIGURE
+          echo ========================================
+          call configure.bat --with-php-build="%PHP_DEV%" --with-mysql=shared,mysqlnd > configure-output.log 2>&1
+          set "CONFIGURE_EXIT=%ERRORLEVEL%"
+          type configure-output.log
+
+          if not "%CONFIGURE_EXIT%"=="0" (
+              echo.
+              echo ========================================
+              echo CONFIGURE FAILED
+              echo ========================================
+              if exist config.log type config.log
+              exit /b 1
+          )
+
+          echo.
+          echo ========================================
+          echo VERIFY MYSQL WAS ACTUALLY ENABLED
+          echo ========================================
+          findstr /C:"mysql" configure-output.log | findstr /C:"shared" >nul
+          if errorlevel 1 (
+              echo.
+              echo ERROR: config.w32 did NOT enable mysql.
+              echo This means the mysqlnd dependency did not resolve.
+              echo Check that the official QA devel pack provides ext_deps.js.
+              echo.
+              if exist config.log type config.log
+              exit /b 1
+          )
+          findstr /C:"mysql not enabled" configure-output.log >nul && (
+              echo ERROR: config.w32 explicitly disabled mysql.
+              if exist config.log type config.log
+              exit /b 1
+          )
+          echo Confirmed: mysql was enabled by configure.
+
+          if not exist Makefile (echo ERROR: Makefile was not generated & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo NMAKE
+          echo ========================================
+          nmake /nologo > nmake-ts.log 2>&1
+          set "NMAKE_EXIT=%ERRORLEVEL%"
+          type nmake-ts.log
+
+          if not "%NMAKE_EXIT%"=="0" (
+              echo.
+              echo NMAKE FAILED
+              exit /b %NMAKE_EXIT%
+          )
+
+          echo.
+          echo ========================================
+          echo SEARCHING GENERATED DLL
+          echo ========================================
+          set "FOUND_DLL="
+          for /f "delims=" %%F in ('dir /s /b /a-d "%SOURCE%\php_mysql.dll" 2^>nul') do (
+              set "FOUND_DLL=%%F"
+              goto :dll_found
+          )
+          :dll_found
+
+          if not defined FOUND_DLL (
+              echo ERROR: php_mysql.dll was not produced despite mysql being enabled.
+              dir /s /b *.dll *.obj *.lib 2>nul
+              exit /b 1
+          )
+
+          echo Found: !FOUND_DLL!
+          if /I not "!FOUND_DLL!"=="%SOURCE%\php_mysql.dll" (
+              copy /y "!FOUND_DLL!" "%SOURCE%\php_mysql.dll" >nul
+          )
+
+          if not exist "%SOURCE%\php_mysql.dll" (
+              echo ERROR: final TS DLL missing after copy
+              exit /b 1
+          )
+
+          if "%CHECK_REVERSE_API%"=="1" (
+              echo.
+              echo ========================================
+              echo VERIFY NO mysqlnd_reverse_api IMPORTS
+              echo ========================================
+              dumpbin /imports "%SOURCE%\php_mysql.dll" | findstr /i "mysqlnd_reverse_api" >nul
+              if not errorlevel 1 (
+                  echo ERROR: php_mysql.dll still imports a mysqlnd_reverse_api_* symbol.
+                  echo It would fail to load on PHP 8.7+ with "Entry Point Not Found"
+                  echo and crash Apache - the patch is not effective.
+                  exit /b 1
+              )
+              echo Confirmed: no mysqlnd_reverse_api imports - DLL is PHP 8.7+ safe.
+          )
+
+          echo.
+          echo TS DLL READY: %SOURCE%\php_mysql.dll
+          endlocal
+          exit /b 0
+          '@
+
+          $build = $build -replace '\$\{CHECK_REVERSE_API\}', $checkReverseApi
+          Set-Content -Path "C:\build-mysql-ts.bat" -Value $build -Encoding ASCII
+          Write-Host "TS build task created (CHECK_REVERSE_API=$checkReverseApi)."
+
+      - name: Build MySQL TS
+        shell: cmd
+        run: |
+          call C:\php-sdk\phpsdk-vs18-x64.bat -t C:\build-mysql-ts.bat
+          if errorlevel 1 exit /b 1
+
+      # --------------------------------------------------------
+      # Validate, load-test, package
+      # --------------------------------------------------------
+
+      - name: Validate + load-test TS DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dll = "C:\mysql-ts\php_mysql.dll"
+          if (-not (Test-Path $dll)) {
+              Write-Host "Searching inside C:\mysql-ts only (not the whole C: drive):"
+              Get-ChildItem -Path "C:\mysql-ts" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+              throw "TS php_mysql.dll was not produced."
+          }
+
+          Get-Item $dll | Format-List FullName, Length, LastWriteTime
+
+          Copy-Item -Path $dll -Destination "C:\php-bin\php_mysql.dll" -Force
+
+          & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_mysql.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'mysql=',(extension_loaded('mysql')?'OK':'FAILED'),PHP_EOL; echo 'mysql_connect=',(function_exists('mysql_connect')?'OK':'FAILED'),PHP_EOL; echo 'mysql_errno=',(function_exists('mysql_errno')?'OK':'FAILED'),PHP_EOL;"
+
+          if ($LASTEXITCODE -ne 0) { throw "PHP TS failed to load php_mysql.dll." }
+
+          $modules = & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_mysql.dll" -m
+          if ($modules -notcontains "mysql") { throw "php -m does not list the mysql extension." }
+          Write-Host "php -m lists: mysql"
+
+          Write-Host "TS VALIDATION SUCCESS."
+
+      - name: Package TS artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "C:\artifact-ts" -Force | Out-Null
+          Copy-Item -Path "C:\mysql-ts\php_mysql.dll" -Destination "C:\artifact-ts\php_mysql.dll" -Force
+          Compress-Archive -Path "C:\artifact-ts\*" -DestinationPath "mysql-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts.zip" -Force
+
+      - name: Upload TS artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mysql-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts
+          path: mysql-php${{ steps.select_release.outputs.php_series }}-vs18-x64-ts.zip
+          if-no-files-found: error
+
+
+  # ============================================================
+  # BUILD NON-THREAD SAFE
+  # ============================================================
+
+  build-nts:
+    if: ${{ inputs.build_nts }}
+    name: Build MySQL PHP NTS x64
+    runs-on: windows-2025
+    outputs:
+      php_series: ${{ steps.nts_version.outputs.php_series }}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Derive PHP series from qa_version
+        id: nts_version
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.qa_version }}"
+          $phpSeries = ($v -split '\.' | Select-Object -First 2) -join '.'
+          Write-Host "qa_version=$v -> PHP series $phpSeries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
+
+      - name: Verify vendored mysql source is present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = "vendor\mysql-patched.zip"
+          if (-not (Test-Path $f)) {
+              throw "Missing required vendored file: $f -- upload it to the repo first (see comments at the top of this workflow)."
+          }
+          Write-Host "Found: $f"
+
+      - name: Download PHP NTS binary + devel pack
+        shell: pwsh
+        env:
+          QA_VERSION: ${{ inputs.qa_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Get-FileWithRetry {
+              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
+
+              for ($i = 1; $i -le $Retries; $i++) {
+                  try {
+                      Write-Host "[$i/$Retries] Downloading: $Url"
+                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
+
+                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
+                      $size = (Get-Item $OutFile).Length
+                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
+
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem
+                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
+                      $zip.Dispose()
+
+                      Write-Host "OK ($size bytes)."
+                      return
+                  } catch {
+                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
+                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
+                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
+                  }
+              }
+              throw "Failed to download a valid archive from $Url after $Retries attempts."
+          }
+
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
+          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
+
+      - name: Download and extract PHP SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          for ($i = 1; $i -le 5; $i++) {
+              try {
+                  Write-Host "[$i/5] Downloading PHP SDK from GitHub..."
+                  Invoke-WebRequest -Uri "https://github.com/php/php-sdk-binary-tools/archive/refs/heads/master.zip" -OutFile "sdk.zip" -UseBasicParsing
+                  break
+              } catch {
+                  Write-Host "Attempt $i failed: $($_.Exception.Message)"
+                  if ($i -eq 5) { throw "Failed to download PHP SDK from GitHub after 5 attempts." }
+                  Start-Sleep -Seconds (5 * $i)
+              }
+          }
+
+          if (Test-Path "C:\php-sdk") { Remove-Item "C:\php-sdk" -Recurse -Force }
+          New-Item -ItemType Directory -Path "C:\php-sdk-extract" -Force | Out-Null
+          Expand-Archive -Path "sdk.zip" -DestinationPath "C:\php-sdk-extract" -Force
+
+          $root = Get-ChildItem -Path "C:\php-sdk-extract" -Directory | Select-Object -First 1
+          if (-not $root) { throw "PHP SDK archive root was not found." }
+          Move-Item -Path $root.FullName -Destination "C:\php-sdk" -Force
+
+          $starter = Get-ChildItem -Path "C:\php-sdk" -Recurse -Filter "phpsdk-vs18-x64.bat" | Select-Object -First 1
+          if (-not $starter) { throw "phpsdk-vs18-x64.bat not found in downloaded SDK." }
+
+          $bison = Get-ChildItem -Path "C:\php-sdk" -Recurse -Filter "bison.exe" | Select-Object -First 1
+          if (-not $bison) { throw "bison.exe not found in downloaded SDK." }
+
+          Write-Host "SDK starter: $($starter.FullName)"
+          Write-Host "bison.exe:   $($bison.FullName)"
+
+      - name: Extract mysql source (vendored, pre-patched) - NTS copy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "C:\mysql-nts") { Remove-Item "C:\mysql-nts" -Recurse -Force }
+          New-Item -ItemType Directory -Path "C:\mysql-nts-raw" -Force | Out-Null
+
+          Expand-Archive -Path "vendor\mysql-patched.zip" -DestinationPath "C:\mysql-nts-raw" -Force
+
+          $configw32 = Get-ChildItem -Path "C:\mysql-nts-raw" -Recurse -Filter "config.w32" | Select-Object -First 1
+          if (-not $configw32) { throw "config.w32 not found inside vendored mysql source zip." }
+
+          Move-Item -Path $configw32.Directory.FullName -Destination "C:\mysql-nts" -Force
+
+          Write-Host "mysql source root: C:\mysql-nts"
+
+      - name: Verify PHP 8.7+ compatibility patch is present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = "C:\mysql-nts\php_mysql.c"
+          if (-not (Test-Path $source)) { throw "php_mysql.c not found." }
+
+          $text = Get-Content -Path $source -Raw
+
+          if ($text -match '#ifdef MYSQL_USE_MYSQLND\r?\n\tmysqlnd_reverse_api_register_api') {
+              throw "An UNGUARDED mysqlnd_reverse_api_register_api() call is still present. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('#if PHP_VERSION_ID < 80700'))) {
+              throw "The PHP 8.7 version guard (#if PHP_VERSION_ID < 80700) around the reverse-API registration was not found. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('#if defined(MYSQL_USE_MYSQLND) && PHP_VERSION_ID < 80700'))) {
+              throw "The version guard on the mysqlnd_reverse_api_register_api() MINIT call was not found. The vendored zip is not actually patched."
+          }
+
+          if ($text.Contains('zval_dtor(')) {
+              throw "zval_dtor() is still referenced - it was removed from the public PHP API and does not compile on current 8.6/8.7. The vendored zip is not actually patched."
+          }
+
+          if ($text.Contains('zend_exception_get_default(')) {
+              throw "zend_exception_get_default() is still referenced - it was removed and does not compile on current 8.6/8.7. The vendored zip is not actually patched."
+          }
+
+          if (-not ($text.Contains('ZSTR_VAL(php_get_current_user())'))) {
+              throw "The zend_string migration of php_get_current_user() was not found. The vendored zip is not actually patched."
+          }
+
+          Write-Host "PHP 8.6/8.7 compatibility patch confirmed present (reverse-API guard + zval_dtor + zend_ce_exception + php_get_current_user fixes)."
+
+      - name: Extract PHP NTS binary + devel pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "C:\php-bin")   { Remove-Item "C:\php-bin" -Recurse -Force }
+          if (Test-Path "C:\php-devel") { Remove-Item "C:\php-devel" -Recurse -Force }
+
+          # --- PHP binary (QA zips are flat - php.exe at root) ---
+          New-Item -ItemType Directory -Path "C:\php-bin" -Force | Out-Null
+          Expand-Archive -Path "php-nts.zip" -DestinationPath "C:\php-bin" -Force
+
+          $php = "C:\php-bin\php.exe"
+          if (-not (Test-Path $php)) {
+              # Safety: if QA format changed and now wraps in subdirectory, flatten it
+              $found = Get-ChildItem -Path "C:\php-bin" -Recurse -Filter "php.exe" | Select-Object -First 1
+              if (-not $found) { throw "php.exe not found anywhere in the extracted PHP NTS binary." }
+              $innerDir = $found.Directory.FullName
+              Write-Host "Flattening: php.exe is in $innerDir, moving contents to C:\php-bin"
+              Get-ChildItem -Path $innerDir | Move-Item -Destination "C:\php-bin" -Force
+              if ((Get-ChildItem -Path $innerDir -ErrorAction SilentlyContinue).Count -eq 0) {
+                  Remove-Item $innerDir -Force
+              }
+          }
+          $php = "C:\php-bin\php.exe"
+          if (-not (Test-Path $php)) { throw "php.exe not found after extracting PHP NTS binary." }
+          & $php -v
+
+          # --- Devel pack (QA devel packs have a subdirectory wrapper) ---
+          New-Item -ItemType Directory -Path "C:\php-devel-extract" -Force | Out-Null
+          Expand-Archive -Path "php-devel-nts.zip" -DestinationPath "C:\php-devel-extract" -Force
+
+          $phpize = Get-ChildItem -Path "C:\php-devel-extract" -Recurse -Filter "phpize.bat" | Select-Object -First 1
+          if (-not $phpize) { throw "phpize.bat not found in the downloaded PHP NTS devel pack." }
+
+          $develDir = $phpize.Directory.FullName
+          Write-Host "Found phpize.bat in: $develDir"
+
+          Move-Item -Path $develDir -Destination "C:\php-devel" -Force
+
+          # Verify critical files at expected paths
+          if (-not (Test-Path "C:\php-devel\phpize.bat")) { throw "phpize.bat not at C:\php-devel\phpize.bat" }
+          if (-not (Test-Path "C:\php-devel\script\ext_deps.js")) { throw "script/ext_deps.js missing from devel pack (needed so ADD_EXTENSION_DEP('mysql','mysqlnd') resolves)." }
+          if (-not (Test-Path "C:\php-devel\include\main\php.h")) {
+              Write-Host "WARNING: C:\php-devel\include\main\php.h not found directly, checking subdirectories..."
+              $h = Get-ChildItem -Path "C:\php-devel" -Recurse -Filter "php.h" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match '\\main\\' } | Select-Object -First 1
+              if (-not $h) { throw "php.h not found in the devel pack at all." }
+              Write-Host "Found php.h at $($h.FullName), flattening include/ directory"
+              $innerInclude = $h.Directory.Parent.FullName
+              if (-not (Test-Path "C:\php-devel\include")) {
+                  Move-Item -Path $innerInclude -Destination "C:\php-devel\include" -Force
+              }
+          }
+          Write-Host "PHP devel pack root: C:\php-devel"
+          Write-Host "PHP core headers confirmed at C:\php-devel\include\main\php.h"
+
+      - name: Create NTS build task
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Only enforce the no-reverse-API-import check when the NTS
+          # target is itself PHP >= 8.7 (the QA cycle normally provides
+          # 8.6 here, which still HAS the reverse API - registration is
+          # then intentionally kept by the version guard in the patch).
+          $series = '${{ steps.nts_version.outputs.php_series }}'
+          $checkReverseApi = "0"
+          try {
+              if ([version]$series -ge [version]"8.7") { $checkReverseApi = "1" }
+          } catch {
+              Write-Host "WARNING: could not parse PHP series '$series' as a version - skipping reverse-API import check."
+          }
+          Write-Host "PHP series: $series -> CHECK_REVERSE_API=$checkReverseApi"
+
+          $build = @'
+          @echo off
+          setlocal EnableExtensions EnableDelayedExpansion
+
+          set "PHP_DEV=C:\php-devel"
+          set "SOURCE=C:\mysql-nts"
+          set "CHECK_REVERSE_API=${CHECK_REVERSE_API}"
+
+          echo ========================================
+          echo PHP NTS x64 / ext/mysql (legacy)
+          echo ========================================
+
+          where cl    >nul || (echo ERROR: cl.exe not found & exit /b 1)
+          where link  >nul || (echo ERROR: link.exe not found & exit /b 1)
+          where nmake >nul || (echo ERROR: nmake.exe not found & exit /b 1)
+          where dumpbin >nul || (echo ERROR: dumpbin.exe not found & exit /b 1)
+
+          if not exist "%PHP_DEV%\phpize.bat" (echo ERROR: phpize.bat missing & exit /b 1)
+          if not exist "%PHP_DEV%\include\main\php.h" (echo ERROR: PHP headers missing & exit /b 1)
+          if not exist "%PHP_DEV%\include\ext\mysqlnd\mysqlnd.h" (echo ERROR: mysqlnd headers missing & exit /b 1)
+
+          cd /d "%SOURCE%"
+          if errorlevel 1 (echo ERROR: cannot cd into source & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo PHPIZE
+          echo ========================================
+          call "%PHP_DEV%\phpize.bat"
+          if errorlevel 1 (echo PHPIZE FAILED & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo CONFIGURE
+          echo ========================================
+          call configure.bat --with-php-build="%PHP_DEV%" --disable-zts --with-mysql=shared,mysqlnd > configure-output.log 2>&1
+          set "CONFIGURE_EXIT=%ERRORLEVEL%"
+          type configure-output.log
+
+          if not "%CONFIGURE_EXIT%"=="0" (
+              echo.
+              echo ========================================
+              echo CONFIGURE FAILED
+              echo ========================================
+              if exist config.log type config.log
+              exit /b 1
+          )
+
+          echo.
+          echo ========================================
+          echo VERIFY MYSQL WAS ACTUALLY ENABLED
+          echo ========================================
+          findstr /C:"mysql" configure-output.log | findstr /C:"shared" >nul
+          if errorlevel 1 (
+              echo.
+              echo ERROR: config.w32 did NOT enable mysql.
+              echo Check that the QA devel pack provides ext_deps.js.
+              echo.
+              if exist config.log type config.log
+              exit /b 1
+          )
+          findstr /C:"mysql not enabled" configure-output.log >nul && (
+              echo ERROR: config.w32 explicitly disabled mysql.
+              if exist config.log type config.log
+              exit /b 1
+          )
+          echo Confirmed: mysql was enabled by configure.
+
+          if not exist Makefile (echo ERROR: Makefile was not generated & exit /b 1)
+
+          echo.
+          echo ========================================
+          echo NMAKE
+          echo ========================================
+          nmake /nologo > nmake-nts.log 2>&1
+          set "NMAKE_EXIT=%ERRORLEVEL%"
+          type nmake-nts.log
+
+          if not "%NMAKE_EXIT%"=="0" (
+              echo.
+              echo NMAKE FAILED
+              exit /b %NMAKE_EXIT%
+          )
+
+          echo.
+          echo ========================================
+          echo SEARCHING GENERATED DLL
+          echo ========================================
+          set "FOUND_DLL="
+          for /f "delims=" %%F in ('dir /s /b /a-d "%SOURCE%\php_mysql.dll" 2^>nul') do (
+              set "FOUND_DLL=%%F"
+              goto :dll_found
+          )
+          :dll_found
+
+          if not defined FOUND_DLL (
+              echo ERROR: php_mysql.dll was not produced despite mysql being enabled.
+              dir /s /b *.dll *.obj *.lib 2>nul
+              exit /b 1
+          )
+
+          echo Found: !FOUND_DLL!
+          if /I not "!FOUND_DLL!"=="%SOURCE%\php_mysql.dll" (
+              copy /y "!FOUND_DLL!" "%SOURCE%\php_mysql.dll" >nul
+          )
+
+          if not exist "%SOURCE%\php_mysql.dll" (
+              echo ERROR: final NTS DLL missing after copy
+              exit /b 1
+          )
+
+          if "%CHECK_REVERSE_API%"=="1" (
+              echo.
+              echo ========================================
+              echo VERIFY NO mysqlnd_reverse_api IMPORTS
+              echo ========================================
+              dumpbin /imports "%SOURCE%\php_mysql.dll" | findstr /i "mysqlnd_reverse_api" >nul
+              if not errorlevel 1 (
+                  echo ERROR: php_mysql.dll still imports a mysqlnd_reverse_api_* symbol.
+                  echo It would fail to load on PHP 8.7+ with "Entry Point Not Found".
+                  exit /b 1
+              )
+              echo Confirmed: no mysqlnd_reverse_api imports - DLL is PHP 8.7+ safe.
+          )
+
+          echo.
+          echo NTS DLL READY: %SOURCE%\php_mysql.dll
+          endlocal
+          exit /b 0
+          '@
+
+          $build = $build -replace '\$\{CHECK_REVERSE_API\}', $checkReverseApi
+          Set-Content -Path "C:\build-mysql-nts.bat" -Value $build -Encoding ASCII
+          Write-Host "NTS build task created (CHECK_REVERSE_API=$checkReverseApi)."
+
+      - name: Build MySQL NTS
+        shell: cmd
+        run: |
+          call C:\php-sdk\phpsdk-vs18-x64.bat -t C:\build-mysql-nts.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Validate + load-test NTS DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dll = "C:\mysql-nts\php_mysql.dll"
+          if (-not (Test-Path $dll)) {
+              Write-Host "Searching inside C:\mysql-nts only:"
+              Get-ChildItem -Path "C:\mysql-nts" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+              throw "NTS php_mysql.dll was not produced."
+          }
+
+          Get-Item $dll | Format-List FullName, Length, LastWriteTime
+
+          Copy-Item -Path $dll -Destination "C:\php-bin\php_mysql.dll" -Force
+
+          & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_mysql.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'mysql=',(extension_loaded('mysql')?'OK':'FAILED'),PHP_EOL; echo 'mysql_connect=',(function_exists('mysql_connect')?'OK':'FAILED'),PHP_EOL; echo 'mysql_errno=',(function_exists('mysql_errno')?'OK':'FAILED'),PHP_EOL;"
+
+          if ($LASTEXITCODE -ne 0) { throw "PHP NTS failed to load php_mysql.dll." }
+
+          $modules = & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_mysql.dll" -m
+          if ($modules -notcontains "mysql") { throw "php -m does not list the mysql extension." }
+          Write-Host "php -m lists: mysql"
+
+          Write-Host "NTS VALIDATION SUCCESS."
+
+      - name: Package NTS artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "C:\artifact-nts" -Force | Out-Null
+          Copy-Item -Path "C:\mysql-nts\php_mysql.dll" -Destination "C:\artifact-nts\php_mysql.dll" -Force
+          Compress-Archive -Path "C:\artifact-nts\*" -DestinationPath "mysql-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts.zip" -Force
+
+      - name: Upload NTS artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mysql-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts
+          path: mysql-php${{ steps.nts_version.outputs.php_series }}-vs18-x64-nts.zip
+          if-no-files-found: error
+
+
+  # ============================================================
+  # RELEASE JOB
+  # ============================================================
+  release:
+    needs: [build-ts, build-nts]
+    if: ${{ !cancelled() && (needs.build-ts.result == 'success' || needs.build-ts.result == 'skipped') && (needs.build-nts.result == 'success' || needs.build-nts.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Consolidate zip files
+        run: |
+          mkdir -p release_assets
+          find artifacts -name "mysql-php*.zip" -exec cp {} release_assets/ \;
+          ls -la release_assets/
+
+      - name: Generate release metadata
+        id: meta
+        run: |
+          set -eu
+          BUILD_DATE=$(date -u +'%Y-%m-%d')
+          BUILD_TIME=$(date -u +'%H:%M UTC')
+
+          # Derive everything from the assets that were ACTUALLY built -
+          # never from a free-text input. One PHP series -> mysql-phpX.Y-*;
+          # mixed series (TS and NTS from different series) -> an explicit
+          # multi-version release.
+          VERSIONS=$(ls release_assets | grep -oP '^mysql-php\K[0-9]+\.[0-9]+' | sort -u)
+          VER_COUNT=$(printf '%s\n' "$VERSIONS" | grep -c . || true)
+          if [ "$VER_COUNT" -eq 1 ]; then
+            VER=$(printf '%s\n' "$VERSIONS")
+            TAG="mysql-php${VER}-vs18-x64-${BUILD_DATE}"
+            NAME="MySQL (legacy ext/mysql) PHP ${VER} VS18 x64 - ${BUILD_DATE}"
+          elif [ "$VER_COUNT" -gt 1 ]; then
+            TAG="mysql-vs18-x64-${BUILD_DATE}"
+            NAME="MySQL (legacy ext/mysql) VS18 x64 (multi-version) - ${BUILD_DATE}"
+          else
+            echo "ERROR: no mysql-php*.zip assets found in release_assets/" >&2
+            exit 1
+          fi
+
+          # Asset table generated from the real files
+          ASSET_TABLE=""
+          for f in release_assets/*.zip; do
+            base=$(basename "$f" .zip)
+            type="Thread Safe"
+            case "$base" in *-nts|*-nts-*) type="Non-Thread Safe";; esac
+            use="Apache mod_php / XAMPP"
+            if [ "$type" = "Non-Thread Safe" ]; then use="IIS / Nginx FastCGI"; fi
+            ASSET_TABLE="${ASSET_TABLE}| \`${base}.zip\` | ${type} | ${use} |"$'\n'
+          done
+
+          # Version line from what the build jobs actually used
+          TS_TAG='${{ needs.build-ts.outputs.release_tag }}'
+          TS_SERIES='${{ needs.build-ts.outputs.php_series }}'
+          NTS_SERIES='${{ needs.build-nts.outputs.php_series }}'
+          QA_VER='${{ inputs.qa_version }}'
+          TS_PART=""
+          if [ -n "$TS_TAG" ]; then TS_PART="**TS**: own release \`${TS_TAG}\` (PHP ${TS_SERIES})"; fi
+          NTS_PART=""
+          if [ -n "$NTS_SERIES" ]; then NTS_PART="**NTS**: official php.net QA \`php-${QA_VER}\` (PHP ${NTS_SERIES})"; fi
+          if [ -n "$TS_PART" ] && [ -n "$NTS_PART" ]; then
+            VERSION_LINE="${TS_PART} · ${NTS_PART}"
+          elif [ -n "$TS_PART" ]; then
+            VERSION_LINE="$TS_PART"
+          elif [ -n "$NTS_PART" ]; then
+            VERSION_LINE="$NTS_PART"
+          else
+            VERSION_LINE="none (both variants were disabled)"
+          fi
+
+          REQ_LINE="The TS DLL requires the TS PHP build of the same series it was compiled against (the own-repo release above); the NTS DLL requires the official php-${QA_VER} NTS build or a newer one of the same series. A DLL works with both the AVX2 and standard builds of its series (identical ABI)."
+
+          {
+            echo "tag_name=${TAG}"
+            echo "name=${NAME}"
+            echo "build_date=${BUILD_DATE}"
+            echo "build_time=${BUILD_TIME}"
+            echo "version_line<<METADATA_EOF"
+            printf '%s' "$VERSION_LINE"
+            echo ""
+            echo "METADATA_EOF"
+            echo "requirement_line<<METADATA_EOF"
+            printf '%s' "$REQ_LINE"
+            echo ""
+            echo "METADATA_EOF"
+            echo "asset_table<<METADATA_EOF"
+            printf '%s' "$ASSET_TABLE"
+            echo "METADATA_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.name }}
+          body: |
+            # MySQL extension (legacy ext/mysql) for PHP - VS2024 x64 builds
+
+            The classic `mysql_*` API (PHP 3-5, removed from the core in PHP 7)
+            as a PECL extension ([php/pecl-database-mysql](https://github.com/php/pecl-database-mysql)),
+            patched and rebuilt to work with current PHP.
+
+            | Field | Value |
+            |---|---|
+            | **Build date** | ${{ steps.meta.outputs.build_date }} ${{ steps.meta.outputs.build_time }} |
+            | **Compiler** | Visual Studio 2024 (VC18, vs18) |
+            | **Runner** | windows-2025 |
+            | **PHP version** | ${{ steps.meta.outputs.version_line }} |
+
+            ## Why a patch is needed for PHP 8.7
+
+            PHP 8.7 removed the mysqlnd reverse API (php/php-src PR #21409,
+            commit `58b4cc2df0`). Every `php_mysql.dll` compiled against
+            PHP ≤ 8.6 imports `mysqlnd_reverse_api_register_api` from
+            `php8ts.dll` and dies at load time on PHP 8.7 with:
+
+            > `httpd.exe - Entry Point Not Found`
+            > `The procedure entry point mysqlnd_reverse_api_register_api could not be located in the dynamic link library ...\ext\php_mysql.dll`
+
+            ...taking Apache down with it. The vendored source registers
+            itself only on PHP ≤ 8.6 (`#if PHP_VERSION_ID < 80700`), which
+            changes nothing functionally (mysqli/PDO_MYSQL dropped the
+            feature upstream too) and produces a DLL that loads cleanly on
+            8.7. The build verifies via `dumpbin` that no
+            `mysqlnd_reverse_api_*` symbol is imported.
+
+            ## Downloads
+
+            Each zip contains `php_mysql.dll`. No extra runtime DLLs are
+            needed - mysqlnd is built into `php8ts.dll` / `php8.dll`.
+
+            | Asset | Type | Use case |
+            |---|---|---|
+            ${{ steps.meta.outputs.asset_table }}
+
+            ## Installation
+
+            1. Extract the zip matching your PHP variant (TS or NTS)
+            2. Copy `php_mysql.dll` to your PHP `ext/` directory (e.g. `C:\xampp\apps\php\ext\`)
+            3. Add to `php.ini`:
+               ```ini
+               extension=php_mysql.dll
+               ```
+            4. Restart Apache / PHP-FPM
+            5. Verify: `php -m | findstr mysql` should list "mysql"
+
+            ## Requirements
+
+            - ${{ steps.meta.outputs.requirement_line }}
+            - Windows x64 (10/11, Server 2016+)
+            - A MySQL server to connect to (the extension is a client API)
+
+            ## Source
+
+            - Extension source: https://github.com/php/pecl-database-mysql (patched, vendored in this repo)
+            - Built with: https://github.com/php/php-sdk-binary-tools
+            - PHP SDK: phpsdk-vs18-x64.bat (VS2024 / vs18)
+
+            ---
+
+            *Automated build via workflow `build-mysql.yaml`.*
+          files: release_assets/*.zip
+          generate_release_notes: false
+          draft: false
+          prerelease: true
