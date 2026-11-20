@@ -587,6 +587,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          trap {
+              $m = ($_ | Out-String) -replace '%','%25' -replace "`r",'%0D' -replace "`n",'%0A'
+              Write-Host "::error title=Validate TS DLL::$m"
+              break
+          }
 
           $dll = "C:\imagick-ts\php_imagick.dll"
           if (-not (Test-Path $dll)) {
@@ -605,9 +610,14 @@ jobs:
           }
           Copy-Item -Path $dll -Destination "C:\php-bin\php_imagick.dll" -Force
 
-          & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_imagick.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'Imagick=',(extension_loaded('imagick')?'OK':'FAILED'),PHP_EOL; echo 'ImageMagick=',Imagick::getVersion()['versionString'],PHP_EOL;"
+          $phpOut = & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_imagick.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'Imagick=',(extension_loaded('imagick')?'OK':'FAILED'),PHP_EOL; echo 'ImageMagick=',Imagick::getVersion()['versionString'],PHP_EOL;" 2>&1 | Out-String
+          $phpExit = $LASTEXITCODE
+          Write-Host $phpOut
 
-          if ($LASTEXITCODE -ne 0) { throw "PHP TS failed to load php_imagick.dll." }
+          if ($phpExit -ne 0) {
+              $info = & "C:\php-bin\php.exe" -n -i 2>&1 | Select-String -Pattern 'PHP API|PHP Extension Build|Zend Extension Build|Thread Safety|Architecture|Compiler|^PHP Version' | Out-String
+              throw "PHP TS failed to load php_imagick.dll (exit code $phpExit).`n--- php output ---`n$phpOut`n--- php -i (build info) ---`n$info"
+          }
           Write-Host "TS VALIDATION SUCCESS."
 
       - name: Package TS artifact
