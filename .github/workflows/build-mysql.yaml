@@ -90,9 +90,13 @@ on:
         type: string
         default: "latest"
       qa_version:
-        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC3)"
+        description: "Official php.net build used for the NTS variant and as the script/ base for TS: 'auto' (newest available of qa_series, from QA or /releases) or an exact version such as 8.6.0RC7 or 8.6.0"
         type: string
-        default: "8.6.0RC3"
+        default: "auto"
+      qa_series:
+        description: "PHP series that 'auto' picks the official build from"
+        type: string
+        default: "8.6"
 
 permissions:
   contents: read
@@ -114,6 +118,19 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Resolve official php.net build (script/ base for TS)
+        id: qa
+        shell: pwsh
+        env:
+          QA_VERSION_INPUT: ${{ inputs.qa_version }}
+          QA_SERIES_INPUT: ${{ inputs.qa_series }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
+          $r = Resolve-OfficialPhpBuild -Version $env:QA_VERSION_INPUT -Series $env:QA_SERIES_INPUT -Files @('php-devel-pack-{V}-Win32-vs18-x64.zip')
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_version=$($r.Version)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_base_url=$($r.BaseUrl)"
 
       - name: Verify vendored mysql source is present
         shell: pwsh
@@ -138,32 +155,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Get-FileWithRetry {
-              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
-
-              for ($i = 1; $i -le $Retries; $i++) {
-                  try {
-                      Write-Host "[$i/$Retries] Downloading: $Url"
-                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
-
-                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
-                      $size = (Get-Item $OutFile).Length
-                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
-
-                      Add-Type -AssemblyName System.IO.Compression.FileSystem
-                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
-                      $zip.Dispose()
-
-                      Write-Host "OK ($size bytes)."
-                      return
-                  } catch {
-                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
-                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
-                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
-                  }
-              }
-              throw "Failed to download a valid archive from $Url after $Retries attempts."
-          }
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
 
           # Select the own-repo release to build the TS variant against,
           # per the php_release input:
@@ -209,7 +201,7 @@ jobs:
           # QA devel pack to steal its script/ directory (its ext_deps.js is
           # what makes ADD_EXTENSION_DEP('mysql', 'mysqlnd') resolve, since
           # mysqlnd is statically built into php8ts.dll).
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-${{ inputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
+          Get-FileWithRetry -Url "${{ steps.qa.outputs.qa_base_url }}/php-devel-pack-${{ steps.qa.outputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
 
       # --------------------------------------------------------
       # Download + extract PHP SDK from GitHub
@@ -661,16 +653,30 @@ jobs:
     runs-on: windows-2025
     outputs:
       php_series: ${{ steps.nts_version.outputs.php_series }}
+      qa_version: ${{ steps.qa.outputs.qa_version }}
     steps:
 
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Resolve official php.net build (NTS binary + devel pack)
+        id: qa
+        shell: pwsh
+        env:
+          QA_VERSION_INPUT: ${{ inputs.qa_version }}
+          QA_SERIES_INPUT: ${{ inputs.qa_series }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
+          $r = Resolve-OfficialPhpBuild -Version $env:QA_VERSION_INPUT -Series $env:QA_SERIES_INPUT -Files @('php-{V}-nts-Win32-vs18-x64.zip', 'php-devel-pack-{V}-nts-Win32-vs18-x64.zip')
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_version=$($r.Version)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_base_url=$($r.BaseUrl)"
+
       - name: Derive PHP series from qa_version
         id: nts_version
         shell: pwsh
         run: |
-          $v = "${{ inputs.qa_version }}"
+          $v = "${{ steps.qa.outputs.qa_version }}"
           $phpSeries = ($v -split '\.' | Select-Object -First 2) -join '.'
           Write-Host "qa_version=$v -> PHP series $phpSeries"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
@@ -688,39 +694,15 @@ jobs:
       - name: Download PHP NTS binary + devel pack
         shell: pwsh
         env:
-          QA_VERSION: ${{ inputs.qa_version }}
+          QA_VERSION: ${{ steps.qa.outputs.qa_version }}
+          QA_BASE_URL: ${{ steps.qa.outputs.qa_base_url }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Get-FileWithRetry {
-              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
 
-              for ($i = 1; $i -le $Retries; $i++) {
-                  try {
-                      Write-Host "[$i/$Retries] Downloading: $Url"
-                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
-
-                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
-                      $size = (Get-Item $OutFile).Length
-                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
-
-                      Add-Type -AssemblyName System.IO.Compression.FileSystem
-                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
-                      $zip.Dispose()
-
-                      Write-Host "OK ($size bytes)."
-                      return
-                  } catch {
-                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
-                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
-                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
-                  }
-              }
-              throw "Failed to download a valid archive from $Url after $Retries attempts."
-          }
-
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
+          Get-FileWithRetry -Url "$env:QA_BASE_URL/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
+          Get-FileWithRetry -Url "$env:QA_BASE_URL/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
 
       - name: Download and extract PHP SDK
         shell: pwsh
@@ -1130,7 +1112,7 @@ jobs:
           TS_TAG='${{ needs.build-ts.outputs.release_tag }}'
           TS_SERIES='${{ needs.build-ts.outputs.php_series }}'
           NTS_SERIES='${{ needs.build-nts.outputs.php_series }}'
-          QA_VER='${{ inputs.qa_version }}'
+          QA_VER='${{ needs.build-nts.outputs.qa_version }}'
           TS_PART=""
           if [ -n "$TS_TAG" ]; then TS_PART="**TS**: own release \`${TS_TAG}\` (PHP ${TS_SERIES})"; fi
           NTS_PART=""
