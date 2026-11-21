@@ -452,6 +452,22 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          # PHP 8.7 headers require C11 or later (Zend/zend_portability.h #errors without
+          # __STDC_VERSION__ >= 201112L), but the 8.6-era phpize build system used as the
+          # base never passes /std: to cl.exe -> "fatal error C1189: Zend requires C11 or
+          # later". For a TS target series >= 8.7 inject the flags php-src master's own
+          # confutils.js uses, via the MSVC _CL_ environment variable (cl.exe appends it to
+          # every invocation). Same fix as build-mysql.yaml. NTS is built from one QA era
+          # (8.6) and does not need it.
+          $series = "${{ steps.select_release.outputs.php_series }}"
+          $needC17 = 0
+          try {
+              if ([version]$series -ge [version]'8.7') { $needC17 = 1 }
+          } catch {
+              Write-Host "WARNING: could not parse PHP series '$series' as a version - not injecting C17 flags."
+          }
+          Write-Host "PHP series: $series -> NEED_C17=$needC17"
+
           $build = @'
           @echo off
           setlocal EnableExtensions EnableDelayedExpansion
@@ -459,6 +475,13 @@ jobs:
           set "PHP_DEV=C:\php-devel"
           set "IMAGEMAGICK=C:\ImageMagick"
           set "SOURCE=C:\imagick-ts"
+          set "NEED_C17=${NEED_C17}"
+
+          if "%NEED_C17%"=="1" (
+              REM PHP 8.7 headers require C11+; _CL_ is appended to every cl.exe call.
+              set "_CL_=/std:c17 /experimental:c11atomics"
+              echo Injecting C17 compiler flags via _CL_ for PHP 8.7+ headers
+          )
 
           echo ========================================
           echo PHP TS x64 / Imagick
@@ -570,8 +593,9 @@ jobs:
           exit /b 0
           '@
 
+          $build = $build -replace '\$\{NEED_C17\}', $needC17
           Set-Content -Path "C:\build-imagick-ts.bat" -Value $build -Encoding ASCII
-          Write-Host "TS build task created."
+          Write-Host "TS build task created (NEED_C17=$needC17)."
 
       - name: Build Imagick TS
         shell: cmd
