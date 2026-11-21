@@ -604,11 +604,11 @@ jobs:
               $parts = @()
               foreach ($f in 'configure-output.log', 'nmake-ts.log') {
                   $lp = Join-Path "C:\imagick-ts" $f
-                  if (-not (Test-Path $lp)) { $parts += "--- $f: MISSING (the build task stopped before this stage) ---"; continue }
+                  if (-not (Test-Path $lp)) { $parts += "--- ${f}: MISSING (the build task stopped before this stage) ---"; continue }
                   $lines = Get-Content $lp
                   $errs = @($lines | Select-String -Pattern 'error|fatal|LNK\d{4}|C\d{4}:|not found|NOT enabled|WARNING' | Select-Object -First 25 | ForEach-Object { $_.Line })
-                  $parts += "--- $f : matching lines ---"; $parts += $errs
-                  $parts += "--- $f : last 15 lines ---"; $parts += ($lines | Select-Object -Last 15)
+                  $parts += "--- ${f} : matching lines ---"; $parts += $errs
+                  $parts += "--- ${f} : last 15 lines ---"; $parts += ($lines | Select-Object -Last 15)
               }
               throw ("TS php_imagick.dll was not produced.`n" + ($parts -join "`n"))
           }
