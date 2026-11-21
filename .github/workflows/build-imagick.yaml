@@ -64,9 +64,13 @@ on:
         type: string
         default: "latest"
       qa_version:
-        description: "Full version of the official php.net QA build used for the NTS variant and as the script/ base for TS (e.g. 8.6.0RC3)"
+        description: "Official php.net build used for the NTS variant and as the script/ base for TS: 'auto' (newest available of qa_series, from QA or /releases) or an exact version such as 8.6.0RC7 or 8.6.0"
         type: string
-        default: "8.6.0RC3"
+        default: "auto"
+      qa_series:
+        description: "PHP series that 'auto' picks the official build from"
+        type: string
+        default: "8.6"
 
 permissions:
   contents: read
@@ -97,6 +101,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Resolve official php.net build (script/ base for TS)
+        id: qa
+        shell: pwsh
+        env:
+          QA_VERSION_INPUT: ${{ inputs.qa_version }}
+          QA_SERIES_INPUT: ${{ inputs.qa_series }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
+          $r = Resolve-OfficialPhpBuild -Version $env:QA_VERSION_INPUT -Series $env:QA_SERIES_INPUT -Files @('php-devel-pack-{V}-Win32-vs18-x64.zip')
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_version=$($r.Version)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_base_url=$($r.BaseUrl)"
+
       - name: Verify vendored imagick source is present
         shell: pwsh
         run: |
@@ -121,32 +138,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Get-FileWithRetry {
-              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
-
-              for ($i = 1; $i -le $Retries; $i++) {
-                  try {
-                      Write-Host "[$i/$Retries] Downloading: $Url"
-                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
-
-                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
-                      $size = (Get-Item $OutFile).Length
-                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
-
-                      Add-Type -AssemblyName System.IO.Compression.FileSystem
-                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
-                      $zip.Dispose()
-
-                      Write-Host "OK ($size bytes)."
-                      return
-                  } catch {
-                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
-                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
-                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
-                  }
-              }
-              throw "Failed to download a valid archive from $Url after $Retries attempts."
-          }
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
 
           # Select the own-repo release to build the TS variant against,
           # per the php_release input:
@@ -190,7 +182,7 @@ jobs:
           # Our custom devel pack is missing script/ (phpize.js etc.) because
           # buildconf doesn't generate it for dev builds. Download the official
           # QA devel pack to steal its script/ directory.
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-${{ inputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
+          Get-FileWithRetry -Url "${{ steps.qa.outputs.qa_base_url }}/php-devel-pack-${{ steps.qa.outputs.qa_version }}-Win32-vs18-x64.zip" -OutFile "php-devel-official.zip"
 
           # ImageMagick deps from php.net PECL (unchanged)
           Get-FileWithRetry -Url "https://downloads.php.net/~windows/pecl/deps/ImageMagick-$env:IMAGEMAGICK_VERSION-vs17-x64.zip" -OutFile "imagemagick.zip"
@@ -460,6 +452,22 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          # PHP 8.7 headers require C11 or later (Zend/zend_portability.h #errors without
+          # __STDC_VERSION__ >= 201112L), but the 8.6-era phpize build system used as the
+          # base never passes /std: to cl.exe -> "fatal error C1189: Zend requires C11 or
+          # later". For a TS target series >= 8.7 inject the flags php-src master's own
+          # confutils.js uses, via the MSVC _CL_ environment variable (cl.exe appends it to
+          # every invocation). Same fix as build-mysql.yaml. NTS is built from one QA era
+          # (8.6) and does not need it.
+          $series = "${{ steps.select_release.outputs.php_series }}"
+          $needC17 = 0
+          try {
+              if ([version]$series -ge [version]'8.7') { $needC17 = 1 }
+          } catch {
+              Write-Host "WARNING: could not parse PHP series '$series' as a version - not injecting C17 flags."
+          }
+          Write-Host "PHP series: $series -> NEED_C17=$needC17"
+
           $build = @'
           @echo off
           setlocal EnableExtensions EnableDelayedExpansion
@@ -467,6 +475,13 @@ jobs:
           set "PHP_DEV=C:\php-devel"
           set "IMAGEMAGICK=C:\ImageMagick"
           set "SOURCE=C:\imagick-ts"
+          set "NEED_C17=${NEED_C17}"
+
+          if "%NEED_C17%"=="1" (
+              REM PHP 8.7 headers require C11+; _CL_ is appended to every cl.exe call.
+              set "_CL_=/std:c17 /experimental:c11atomics"
+              echo Injecting C17 compiler flags via _CL_ for PHP 8.7+ headers
+          )
 
           echo ========================================
           echo PHP TS x64 / Imagick
@@ -578,8 +593,9 @@ jobs:
           exit /b 0
           '@
 
+          $build = $build -replace '\$\{NEED_C17\}', $needC17
           Set-Content -Path "C:\build-imagick-ts.bat" -Value $build -Encoding ASCII
-          Write-Host "TS build task created."
+          Write-Host "TS build task created (NEED_C17=$needC17)."
 
       - name: Build Imagick TS
         shell: cmd
@@ -595,12 +611,30 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          trap {
+              $m = ($_ | Out-String) -replace '%','%25' -replace "`r",'%0D' -replace "`n",'%0A'
+              Write-Host "::error title=Validate TS DLL::$m"
+              break
+          }
 
           $dll = "C:\imagick-ts\php_imagick.dll"
           if (-not (Test-Path $dll)) {
               Write-Host "Searching inside C:\imagick-ts only (not the whole C: drive):"
               Get-ChildItem -Path "C:\imagick-ts" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-              throw "TS php_imagick.dll was not produced."
+
+              # phpsdk's "-t" wrapper does not always propagate the task's exit code, so the build
+              # step can look green while phpize/configure/nmake actually failed. Surface the real
+              # reason (error lines + tail of each log) in the failure message / annotation.
+              $parts = @()
+              foreach ($f in 'configure-output.log', 'nmake-ts.log') {
+                  $lp = Join-Path "C:\imagick-ts" $f
+                  if (-not (Test-Path $lp)) { $parts += "--- ${f}: MISSING (the build task stopped before this stage) ---"; continue }
+                  $lines = Get-Content $lp
+                  $errs = @($lines | Select-String -Pattern 'error|fatal|LNK\d{4}|C\d{4}:|not found|NOT enabled|WARNING' | Select-Object -First 25 | ForEach-Object { $_.Line })
+                  $parts += "--- ${f} : matching lines ---"; $parts += $errs
+                  $parts += "--- ${f} : last 15 lines ---"; $parts += ($lines | Select-Object -Last 15)
+              }
+              throw ("TS php_imagick.dll was not produced.`n" + ($parts -join "`n"))
           }
 
           Get-Item $dll | Format-List FullName, Length, LastWriteTime
@@ -613,9 +647,14 @@ jobs:
           }
           Copy-Item -Path $dll -Destination "C:\php-bin\php_imagick.dll" -Force
 
-          & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_imagick.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'Imagick=',(extension_loaded('imagick')?'OK':'FAILED'),PHP_EOL; echo 'ImageMagick=',Imagick::getVersion()['versionString'],PHP_EOL;"
+          $phpOut = & "C:\php-bin\php.exe" -n -d "extension=C:\php-bin\php_imagick.dll" -r "echo 'PHP=',PHP_VERSION,PHP_EOL; echo 'ZTS=',(PHP_ZTS?'yes':'no'),PHP_EOL; echo 'Imagick=',(extension_loaded('imagick')?'OK':'FAILED'),PHP_EOL; echo 'ImageMagick=',Imagick::getVersion()['versionString'],PHP_EOL;" 2>&1 | Out-String
+          $phpExit = $LASTEXITCODE
+          Write-Host $phpOut
 
-          if ($LASTEXITCODE -ne 0) { throw "PHP TS failed to load php_imagick.dll." }
+          if ($phpExit -ne 0) {
+              $info = & "C:\php-bin\php.exe" -n -i 2>&1 | Select-String -Pattern 'PHP API|PHP Extension Build|Zend Extension Build|Thread Safety|Architecture|Compiler|^PHP Version' | Out-String
+              throw "PHP TS failed to load php_imagick.dll (exit code $phpExit).`n--- php output ---`n$phpOut`n--- php -i (build info) ---`n$info"
+          }
           Write-Host "TS VALIDATION SUCCESS."
 
       - name: Package TS artifact
@@ -647,6 +686,7 @@ jobs:
     runs-on: windows-2025
     outputs:
       php_series: ${{ steps.nts_version.outputs.php_series }}
+      qa_version: ${{ steps.qa.outputs.qa_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -657,11 +697,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Resolve official php.net build (NTS binary + devel pack)
+        id: qa
+        shell: pwsh
+        env:
+          QA_VERSION_INPUT: ${{ inputs.qa_version }}
+          QA_SERIES_INPUT: ${{ inputs.qa_series }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
+          $r = Resolve-OfficialPhpBuild -Version $env:QA_VERSION_INPUT -Series $env:QA_SERIES_INPUT -Files @('php-{V}-nts-Win32-vs18-x64.zip', 'php-devel-pack-{V}-nts-Win32-vs18-x64.zip')
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_version=$($r.Version)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "qa_base_url=$($r.BaseUrl)"
+
       - name: Derive PHP series from qa_version
         id: nts_version
         shell: pwsh
         run: |
-          $v = "${{ inputs.qa_version }}"
+          $v = "${{ steps.qa.outputs.qa_version }}"
           $phpSeries = ($v -split '\.' | Select-Object -First 2) -join '.'
           Write-Host "qa_version=$v -> PHP series $phpSeries"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "php_series=$phpSeries"
@@ -679,40 +732,16 @@ jobs:
       - name: Download PHP NTS binary + devel pack + ImageMagick deps
         shell: pwsh
         env:
-          QA_VERSION: ${{ inputs.qa_version }}
+          QA_VERSION: ${{ steps.qa.outputs.qa_version }}
+          QA_BASE_URL: ${{ steps.qa.outputs.qa_base_url }}
           IMAGEMAGICK_VERSION: "7.1.1-47"
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Get-FileWithRetry {
-              param([string]$Url, [string]$OutFile, [int]$Retries = 5)
+          . "$env:GITHUB_WORKSPACE\.github\scripts\php-official.ps1"
 
-              for ($i = 1; $i -le $Retries; $i++) {
-                  try {
-                      Write-Host "[$i/$Retries] Downloading: $Url"
-                      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -MaximumRedirection 10
-
-                      if (-not (Test-Path $OutFile)) { throw "File was not written." }
-                      $size = (Get-Item $OutFile).Length
-                      if ($size -lt 10000) { throw "Downloaded file is suspiciously small ($size bytes) - likely an error page, not a real archive." }
-
-                      Add-Type -AssemblyName System.IO.Compression.FileSystem
-                      $zip = [System.IO.Compression.ZipFile]::OpenRead($OutFile)
-                      $zip.Dispose()
-
-                      Write-Host "OK ($size bytes)."
-                      return
-                  } catch {
-                      Write-Host "Attempt $i failed: $($_.Exception.Message)"
-                      if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
-                      if ($i -lt $Retries) { Start-Sleep -Seconds (5 * $i) }
-                  }
-              }
-              throw "Failed to download a valid archive from $Url after $Retries attempts."
-          }
-
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
-          Get-FileWithRetry -Url "https://downloads.php.net/~windows/qa/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
+          Get-FileWithRetry -Url "$env:QA_BASE_URL/php-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-nts.zip"
+          Get-FileWithRetry -Url "$env:QA_BASE_URL/php-devel-pack-$env:QA_VERSION-nts-Win32-vs18-x64.zip" -OutFile "php-devel-nts.zip"
           Get-FileWithRetry -Url "https://downloads.php.net/~windows/pecl/deps/ImageMagick-$env:IMAGEMAGICK_VERSION-vs17-x64.zip" -OutFile "imagemagick.zip"
 
       - name: Download and extract PHP SDK
@@ -1125,7 +1154,7 @@ jobs:
           TS_TAG='${{ needs.build-ts.outputs.release_tag }}'
           TS_SERIES='${{ needs.build-ts.outputs.php_series }}'
           NTS_SERIES='${{ needs.build-nts.outputs.php_series }}'
-          QA_VER='${{ inputs.qa_version }}'
+          QA_VER='${{ needs.build-nts.outputs.qa_version }}'
           TS_PART=""
           if [ -n "$TS_TAG" ]; then TS_PART="**TS**: own release \`${TS_TAG}\` (PHP ${TS_SERIES})"; fi
           NTS_PART=""
